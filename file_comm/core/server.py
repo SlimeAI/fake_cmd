@@ -14,7 +14,8 @@ from file_comm.utils.comm import (
     create_symbol,
     wait_symbol,
     pop_message,
-    check_symbol
+    check_symbol,
+    remove_symbol
 )
 from file_comm.utils.file import (
     LockedTextIO
@@ -149,8 +150,9 @@ class Command(Thread):
     
     def run(self) -> None:
         msg = self.msg
-        output_fp = self.session_files.concat_fp(msg.output_file_name)
-        terminate_fp = self.session_files.concat_fp(msg.terminate_symbol_name)
+        output_fp = self.session_files.message_output_fp(msg)
+        terminate_server_fp = self.session_files.command_terminate_server_fp(msg)
+        terminate_client_fp = self.session_files.command_terminate_client_fp(msg)
         with LockedTextIO(
             open(output_fp, 'a'), output_fp
         ) as output_f:
@@ -160,14 +162,13 @@ class Command(Thread):
                 stdout=output_f,
                 stderr=output_f
             )
-            terminate_from_remote = False
             while self.process.poll() is None:
-                if check_symbol(terminate_fp):
-                    terminate_from_remote = True
+                if check_symbol(terminate_server_fp, remove_lockfile=True):
                     self.process.kill()
-            
-            if not terminate_from_remote:
-                create_symbol(
-                    self.session_files.concat_fp(msg.terminate_symbol_name)
-                )
-        # TODO: run callbacks.
+            create_symbol(
+                terminate_client_fp
+            )
+
+        # Remove symbol again to ensure it is removed.
+        remove_symbol(terminate_server_fp, remove_lockfile=True)
+        # TODO: callback

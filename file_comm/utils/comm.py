@@ -69,13 +69,6 @@ class Message(ReadonlyAttr):
         """
         return f'{self.msg_id}.output'
     
-    @property
-    def terminate_symbol_name(self) -> str:
-        """
-        Terminate symbol name.
-        """
-        return f'{self.msg_id}.terminate'
-    
     def to_json(self) -> str:
         kwds = {k:getattr(self, k, None) for k in self.json_attrs}
         return json.dumps(kwds)

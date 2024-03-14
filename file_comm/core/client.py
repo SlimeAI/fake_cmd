@@ -1,7 +1,7 @@
 import sys
 import uuid
 import traceback
-from threading import Thread
+from threading import Thread, Event
 from slime_core.utils.registry import Registry
 from slime_core.utils.typing import (
     Callable,
@@ -15,9 +15,10 @@ from file_comm.utils.comm import (
     wait_symbol,
     create_symbol,
     pop_message,
-    check_symbol
+    check_symbol,
+    remove_symbol
 )
-from file_comm.utils.file import pop_all
+from file_comm.utils.file import pop_all, remove_file
 from file_comm.utils.exception import ClientShutdown
 from file_comm.utils import (
     polling
@@ -26,7 +27,19 @@ from . import ServerFiles, SessionFiles, Connection
 
 CLIENT_NOTE = """
 NOTE: enter ``exit`` to shutdown the client.
+NOTE: Use ``Ctrl+C`` AND ``Ctrl+D`` to start a new line.
 """
+
+
+class ClientCLIComm:
+    """
+    Communication items between client and cli.
+    """
+    def __init__(self) -> None:
+        # Indicator that whether a command is running.
+        self.command_running = Event()
+        # Keyboard Interrupt from the main Thread.
+        self.command_terminate = Event()
 
 
 class Client(Connection):
@@ -36,25 +49,44 @@ class Client(Connection):
         self.session_id = str(uuid.uuid1())
         self.server_files = ServerFiles(address)
         self.session_files = SessionFiles(address, self.session_id)
-        self.cli = CLI(self.session_id, self.server_files, self.session_files)
+        self.client_cli_comm = ClientCLIComm()
+        self.cli = CLI(
+            self.session_id,
+            self.server_files,
+            self.session_files,
+            self.client_cli_comm
+        )
     
     def run(self):
         if not self.connect():
             return
         print(f'Connect with server: {self.address}. Session id: {self.session_id}.')
         print(CLIENT_NOTE.strip('\n'))
+        # Start the CLI.
         self.cli.start()
-        for _ in polling():
-            self.heartbeat()
-            msg = pop_message(
-                self.session_files.client_fp,
-                self.session_files.session_path
-            )
-            if msg:
-                pass
-            if not self.cli.is_alive():
-                print(f'Client exit.')
+        while True:
+            try:
+                for _ in polling():
+                    self.heartbeat()
+                    msg = pop_message(
+                        self.session_files.client_fp,
+                        self.session_files.session_path
+                    )
+                    if msg:
+                        # Currently no msg designed.
+                        pass
+                    if not self.cli.is_alive():
+                        print(f'Client exit.')
+                        return
+            except ClientShutdown:
                 return
+            except KeyboardInterrupt:
+                print('Keyboard Interrupt.')
+                comm = self.client_cli_comm
+                if comm.command_running.is_set():
+                    comm.command_terminate.set()
+            except:
+                traceback.print_exc()
     
     def __del__(self):
         print(self.address)
@@ -94,12 +126,14 @@ class CLI(Thread):
         self,
         session_id: str,
         server_files: ServerFiles,
-        session_files: SessionFiles
+        session_files: SessionFiles,
+        client_cli_comm: ClientCLIComm
     ):
         Thread.__init__(self)
         self.session_id = session_id
         self.server_files = server_files
         self.session_files = session_files
+        self.client_cli_comm = client_cli_comm
     
     def run(self):
         while True:
@@ -107,11 +141,16 @@ class CLI(Thread):
                 cmd = input('[fake_cmd] ')
                 msg = self.process_cmd(cmd)
                 if msg:
+                    comm = self.client_cli_comm
+                    comm.command_running.set()
+                    comm.command_terminate.clear()
                     self.wait_server_cmd(msg)
+                    comm.command_running.clear()
+                    comm.command_terminate.clear()
             except ClientShutdown:
                 return
-            except KeyboardInterrupt:
-                print('Keyboard Interrupt.')
+            except EOFError:
+                pass
             except:
                 traceback.print_exc()
     
@@ -121,6 +160,9 @@ class CLI(Thread):
         should be executed in the server and it is successfully received, 
         else return ``False``.
         """
+        if not cmd:
+            return False
+        
         cli_func = self.cli_registry.get(cmd, MISSING)
         if cli_func is MISSING:
             return self.send_server_cmd(cmd)
@@ -147,10 +189,17 @@ class CLI(Thread):
         return msg
     
     def wait_server_cmd(self, msg: Message):
-        terminate_fp = self.session_files.concat_fp(msg.terminate_symbol_name)
-        output_fp = self.session_files.concat_fp(msg.output_file_name)
+        """
+        Wait the server command to finish.
+        """
+        output_fp = self.session_files.message_output_fp(msg)
+        terminate_server_fp = self.session_files.command_terminate_server_fp(msg)
+        terminate_client_fp = self.session_files.command_terminate_client_fp(msg)
         
         def redirect_output():
+            """
+            Redirect the content of ``output_fp`` to the cli.
+            """
             content = pop_all(output_fp)
             if not content:
                 return
@@ -159,12 +208,23 @@ class CLI(Thread):
         
         for _ in polling():
             if check_symbol(
-                terminate_fp,
+                terminate_client_fp,
                 remove_lockfile=True
             ):
+                # Clear the output before terminate.
                 redirect_output()
                 break
+            
             redirect_output()
+            if self.client_cli_comm.command_terminate.is_set():
+                print(
+                    f'Terminating server command: {msg.content}. '
+                )
+                # Notify the server to terminate.
+                create_symbol(terminate_server_fp)
+        # Remove all the files.
+        remove_symbol(terminate_client_fp, remove_lockfile=True)
+        remove_file(output_fp, remove_lockfile=True)
     
     @cli_registry(key='exit')
     def cli_exit(self, cmd: str):

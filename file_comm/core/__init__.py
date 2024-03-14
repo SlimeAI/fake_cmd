@@ -14,7 +14,7 @@ from file_comm.utils.file import create_empty_file
 
 class ServerFiles:
     """
-    Parse server files with given address.
+    Parse server file names.
     """
     
     def __init__(
@@ -37,7 +37,7 @@ class ServerFiles:
 
 class SessionFiles:
     """
-    Parse session files with given address and session id.
+    Parse session file names.
     """
     def __init__(
         self,
@@ -66,6 +66,24 @@ class SessionFiles:
     
     def concat_fp(self, fp: str) -> str:
         return os.path.join(self.session_path, fp)
+    
+    def message_output_fp(self, msg: Message) -> str:
+        """
+        Get the message output file path.
+        """
+        return self.concat_fp(msg.output_file_name)
+    
+    def command_terminate_server_fp(self, msg: Message) -> str:
+        """
+        Get the command terminate server file path.
+        """
+        return self.concat_fp(f'{msg.msg_id}.terminate.server')
+    
+    def command_terminate_client_fp(self, msg: Message) -> str:
+        """
+        Get the command terminate client file path.
+        """
+        return self.concat_fp(f'{msg.msg_id}.terminate.client')
 
 
 ActionFunc = Callable[[Any, Message], None]
