@@ -1,0 +1,2 @@
+
+class ClientShutdown(Exception): pass

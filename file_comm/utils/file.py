@@ -5,10 +5,14 @@ import os
 import time
 import fcntl
 from contextlib import contextmanager
+from slime_core.utils.typing import (
+    TextIO,
+    Any
+)
 from . import polling
 
 
-def get_lockfile_name(fp: str) -> str:
+def get_lockfile_path(fp: str) -> str:
     """
     Get the lockfile name with given ``fp``
     """
@@ -16,19 +20,25 @@ def get_lockfile_name(fp: str) -> str:
 
 
 @contextmanager
-def file_lock(fp: str):
+def file_lock(fp: str, remove_lockfile: bool = False):
     """
     Acquire a file lock. If ``fp`` does not exist, then create a new 
-    file.
+    file. Remove the lock file if ``remove_lockfile`` is ``True``.
     """
+    lockfile_path = get_lockfile_path(fp)
     # The lock file should not be deleted to avoid inconsistency.
-    lock_f = open(get_lockfile_name(fp), 'a')
+    lock_f = open(lockfile_path, 'a')
     fcntl.flock(lock_f, fcntl.LOCK_EX)
     # Use ``open(fp, 'a')`` to create a new file if ``fp`` does not exist.
     with lock_f, open(fp, 'a'):
         try:
             yield
         finally:
+            if remove_lockfile:
+                try:
+                    os.remove(lockfile_path)
+                except FileNotFoundError:
+                    pass
             fcntl.flock(lock_f, fcntl.LOCK_UN)
 
 
@@ -46,7 +56,7 @@ def pop_first_line(fp: str) -> str:
             return first_line
 
         temp_fp = f'{fp}.tmp'
-        with file_lock(temp_fp):
+        with file_lock(temp_fp, remove_lockfile=True):
             with open(temp_fp, 'w') as temp_f:
                 for line in f:
                     # Read the remaining lines and write them to 
@@ -116,26 +126,56 @@ def wait_file(fp: str, timeout=5) -> bool:
             return False
 
 
-def remove_file(fp: str):
+def remove_file(fp: str, remove_lockfile: bool = False):
     """
     Remove a file.
     """
-    with file_lock(fp):
+    with file_lock(fp, remove_lockfile):
         try:
             os.remove(fp)
         except FileNotFoundError:
             pass
 
 
-def remove_file_and_lock(fp: str):
+class LockedTextIO:
     """
-    Remove a file and its corresponding lock.
+    TextIO with file lock.
+    """
     
-    NOTE: This function should be called when you are sure that the 
-    file will never be used by others, thus the lock file can be 
-    safely removed.
-    """
-    remove_file(fp)
-    # NOTE: remove of lock files should not use an extra lock, otherwise 
-    # a new lock file will be created.
-    os.remove(get_lockfile_name(fp))
+    def __init__(
+        self,
+        f: TextIO,
+        fp: str
+    ) -> None:
+        self.f__ = f
+        self.fp__ = fp
+        self.attrs__ = {
+            'write',
+            'writelines',
+            'flush'
+        }
+    
+    def write(self, *args, **kwds):
+        with file_lock(self.fp__):
+            return self.f__.write(*args, **kwds)
+    
+    def writelines(self, *args, **kwds):
+        with file_lock(self.fp__):
+            return self.f__.writelines(*args, **kwds)
+    
+    def flush(self, *args, **kwds):
+        with file_lock(self.fp__):
+            return self.f__.flush(*args, **kwds)
+    
+    def __enter__(self):
+        return self.f__.__enter__()
+    
+    def __exit__(self, *args, **kwds):
+        return self.f__.__exit__(*args, **kwds)
+    
+    def __getattribute__(self, __name: str) -> Any:
+        if __name in {'f__', 'fp__', 'attrs__'}:
+            return super().__getattribute__(__name)
+        if __name in self.attrs__:
+            return super().__getattribute__(__name)
+        return getattr(self.f__, __name)

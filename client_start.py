@@ -1,4 +1,4 @@
-from core.client import Client
+from file_comm.core.client import Client
 
 
 if __name__ == '__main__':

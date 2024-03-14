@@ -1,4 +1,4 @@
-from core.server import Server
+from file_comm.core.server import Server
 
 
 if __name__ == '__main__':

@@ -1,4 +1,5 @@
 import os
+from abc import ABC, abstractmethod
 from slime_core.utils.registry import Registry
 from slime_core.utils.typing import (
     Missing,
@@ -7,8 +8,8 @@ from slime_core.utils.typing import (
     Callable,
     Any
 )
-from utils.comm import Message
-from utils.file import create_empty_file
+from file_comm.utils.comm import Message
+from file_comm.utils.file import create_empty_file
 
 
 class ServerFiles:
@@ -21,7 +22,7 @@ class ServerFiles:
         address: str
     ) -> None:
         self.address = address
-        self.main_fp = os.path.join(address, 'main.listen')
+        self.main_fp = self.concat_fp('main.listen')
 
     def create(self):
         """
@@ -29,6 +30,9 @@ class ServerFiles:
         """
         os.makedirs(self.address, exist_ok=True)
         create_empty_file(self.main_fp)
+    
+    def concat_fp(self, fp: str) -> str:
+        return os.path.join(self.address, fp)
 
 
 class SessionFiles:
@@ -42,14 +46,15 @@ class SessionFiles:
     ) -> None:
         self.session_path = os.path.join(address, session_id)
         # Message transfer.
-        self.server_fp = os.path.join(self.session_path, 'server.queue')
-        self.client_fp = os.path.join(self.session_path, 'client.queue')
-        self.output_fp = os.path.join(self.session_path, 'output.content')
+        self.server_fp = self.concat_fp('server.queue')
+        self.client_fp = self.concat_fp('client.queue')
         # Connect creation.
-        self.conn_server = os.path.join(self.session_path, 'server.conn')
-        self.conn_client = os.path.join(self.session_path, 'client.conn')
+        self.conn_server_fp = self.concat_fp('server.conn')
+        self.conn_client_fp = self.concat_fp('client.conn')
         # Disconnect.
-        self.disconn_server = os
+        self.disconn_server_fp = self.concat_fp('server.disconn')
+        self.disconn_client_fp = self.concat_fp('client.disconn')
+        # Heartbeat.
     
     def create(self):
         """
@@ -58,7 +63,9 @@ class SessionFiles:
         os.makedirs(self.session_path, exist_ok=True)
         create_empty_file(self.server_fp)
         create_empty_file(self.client_fp)
-        create_empty_file(self.output_fp)
+    
+    def concat_fp(self, fp: str) -> str:
+        return os.path.join(self.session_path, fp)
 
 
 ActionFunc = Callable[[Any, Message], None]
@@ -69,6 +76,9 @@ def dispatch_action(
     type: str,
     caller: str
 ) -> Union[ActionFunc, Missing]:
+    """
+    Dispatch the cations with given msg types.
+    """
     action = registry.get(type, MISSING)
     if action is MISSING:
         print(
@@ -76,3 +86,15 @@ def dispatch_action(
             f'and it is ignored. Supported types: {tuple(registry.keys())}'
         )
     return action
+
+
+class Connection(ABC):
+
+    @abstractmethod
+    def connect(self) -> bool: pass
+    
+    @abstractmethod
+    def disconnect(self): pass
+    
+    @abstractmethod
+    def heartbeat(self): pass
