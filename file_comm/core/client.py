@@ -112,7 +112,7 @@ class Client(Connection):
         Destroy before exit.
         """
         self.client_cli_comm.terminate.set()
-        remove_file(self.session_files.client_fp)
+        remove_file(self.session_files.client_fp, remove_lockfile=True)
     
     def connect(self) -> bool:
         if not send_message(
