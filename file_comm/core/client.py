@@ -52,9 +52,11 @@ class Client(Connection):
             )
             if msg:
                 pass
+            if not self.cli.is_alive():
+                print(f'Client exit.')
+                return
     
     def __del__(self):
-        print(self.address)
         print(self.address)
         print('deleted')
     
