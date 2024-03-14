@@ -1,2 +1,2 @@
 
-class ClientShutdown(Exception): pass
+class CLITerminate(Exception): pass

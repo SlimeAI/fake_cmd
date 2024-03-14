@@ -1,5 +1,4 @@
 import os
-from abc import ABC, abstractmethod
 from slime_core.utils.registry import Registry
 from slime_core.utils.typing import (
     Missing,
@@ -55,6 +54,8 @@ class SessionFiles:
         self.disconn_server_fp = self.concat_fp('server.disconn')
         self.disconn_client_fp = self.concat_fp('client.disconn')
         # Heartbeat.
+        self.heartbeat_server_fp = self.concat_fp('server.heartbeat')
+        self.heartbeat_client_fp = self.concat_fp('client.heartbeat')
     
     def create(self):
         """
@@ -104,15 +105,3 @@ def dispatch_action(
             f'and it is ignored. Supported types: {tuple(registry.keys())}'
         )
     return action
-
-
-class Connection(ABC):
-
-    @abstractmethod
-    def connect(self) -> bool: pass
-    
-    @abstractmethod
-    def disconnect(self): pass
-    
-    @abstractmethod
-    def heartbeat(self): pass

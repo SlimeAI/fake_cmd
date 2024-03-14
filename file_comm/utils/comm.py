@@ -5,6 +5,7 @@ import os
 import json
 import time
 import uuid
+from abc import ABC, abstractmethod
 from slime_core.utils.metabase import (
     ReadonlyAttr
 )
@@ -13,7 +14,7 @@ from slime_core.utils.typing import (
     Any,
     Union
 )
-from . import polling
+from . import polling, config
 from .file import (
     pop_first_line,
     append_line,
@@ -183,3 +184,52 @@ def check_symbol(fp: str, remove_lockfile: bool = True) -> bool:
         return True
     else:
         return False
+
+
+class Connection(ABC):
+
+    @abstractmethod
+    def connect(self) -> bool: pass
+
+    @abstractmethod
+    def disconnect(self, initiator: bool): pass
+
+
+class Heartbeat:
+    
+    def __init__(
+        self,
+        receive_fp: str,
+        send_fp: str
+    ) -> None:
+        self.receive_fp = receive_fp
+        self.last_receive = None
+        self.send_fp = send_fp
+        self.last_send = None
+        self.interval = config.heart_beat_interval
+        self.timeout = config.heart_beat_timeout
+    
+    def beat(self) -> bool:
+        now = time.time()
+        received = check_symbol(self.receive_fp)
+        if (
+            not received and 
+            self.last_receive is not None and 
+            (now - self.last_receive) > self.timeout
+        ):
+            print(
+                f'Heartbeat time out at {self.receive_fp}.'
+            )
+            return False
+        
+        if received:
+            self.last_receive = now
+        
+        if (
+            self.last_send is None or 
+            (now - self.last_send) >= self.interval
+        ):
+            create_symbol(self.send_fp)
+            self.last_send = now
+        
+        return True
