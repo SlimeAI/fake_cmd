@@ -7,9 +7,12 @@ import fcntl
 from contextlib import contextmanager
 from slime_core.utils.typing import (
     TextIO,
-    Any
+    Any,
+    Missing,
+    MISSING,
+    Union
 )
-from . import polling
+from . import polling, config
 
 
 def get_lockfile_path(fp: str) -> str:
@@ -111,11 +114,13 @@ def create_empty_file(fp: str, exist_ok: bool = False):
     with file_lock(fp), open(fp, 'w'): pass
 
 
-def wait_file(fp: str, timeout=5) -> bool:
+def wait_file(fp: str, timeout: Union[float, Missing] = MISSING) -> bool:
     """
     Wait the file to be created until timeout. Return ``True`` if 
     the file is successfully created before timeout, else ``False``.
     """
+    timeout = config.wait_timeout if timeout is MISSING else timeout
+    
     start = time.time()
     for _ in polling():
         if os.path.exists(fp):

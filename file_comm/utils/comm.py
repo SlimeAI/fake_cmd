@@ -12,7 +12,9 @@ from slime_core.utils.metabase import (
 from slime_core.utils.typing import (
     Dict,
     Any,
-    Union
+    Union,
+    Missing,
+    MISSING
 )
 from . import polling, config
 from .file import (
@@ -149,7 +151,7 @@ def create_symbol(fp: str):
 
 def wait_symbol(
     fp: str,
-    timeout: int = 5,
+    timeout: Union[float, Missing] = MISSING,
     remove_lockfile: bool = True
 ) -> bool:
     """
@@ -159,6 +161,8 @@ def wait_symbol(
     If the symbol file is a one-time symbol, then set ``remove_lockfile`` 
     to ``True`` to clean the corresponding lockfile.
     """
+    timeout = config.wait_timeout if timeout is MISSING else timeout
+    
     if wait_file(fp, timeout):
         remove_symbol(fp, remove_lockfile)
         return True

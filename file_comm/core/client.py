@@ -4,10 +4,8 @@ import traceback
 from threading import Thread, Event
 from slime_core.utils.registry import Registry
 from slime_core.utils.typing import (
-    Callable,
     MISSING,
-    Union,
-    Any
+    Union
 )
 from file_comm.utils.comm import (
     Connection,
@@ -22,10 +20,13 @@ from file_comm.utils.comm import (
 )
 from file_comm.utils.file import pop_all, remove_file
 from file_comm.utils.exception import CLITerminate
+from file_comm.utils.parallel import (
+    LifecycleRun
+)
 from file_comm.utils import (
     polling
 )
-from . import ServerFiles, SessionFiles
+from . import ServerFiles, SessionFiles, ActionFunc, dispatch_action
 
 CLIENT_NOTE = """
 NOTE: enter ``exit`` to shutdown the client.
@@ -46,7 +47,9 @@ class ClientCLIComm:
         self.terminate = Event()
 
 
-class Client(Connection):
+class Client(LifecycleRun, Connection):
+    
+    client_registry = Registry[ActionFunc]('client_registry')
     
     def __init__(self, address: str) -> None:
         self.address = address
@@ -65,9 +68,14 @@ class Client(Connection):
             self.client_cli_comm
         )
     
-    def run(self):
-        if not self.connect():
-            return
+    #
+    # Running operations.
+    #
+    
+    def before_running(self) -> bool:
+        return self.connect()
+    
+    def running(self):
         print(f'Connect with server: {self.address}. Session id: {self.session_id}.')
         print(CLIENT_NOTE.strip('\n'))
         
@@ -93,19 +101,30 @@ class Client(Connection):
                         self.session_files.session_path
                     )
                     if to_be_destroyed and not msg:
-                        self.destroy()
                         # Directly return.
                         return
                     elif not msg:
                         continue
-                    # ...
-                    # Currently no msg designed.
+                    action = dispatch_action(
+                        self.client_registry,
+                        msg.type,
+                        f'Client'
+                    )
+                    if action is not MISSING:
+                        action(self, msg)
             except KeyboardInterrupt:
                 print('Keyboard Interrupt.')
                 if comm.command_running.is_set():
                     comm.command_terminate.set()
             except:
                 traceback.print_exc()
+    
+    def after_running(self):
+        self.destroy()
+    
+    @client_registry(key='info')
+    def process_info(self, msg: Message):
+        print(msg.content)
     
     def destroy(self):
         """
@@ -143,9 +162,9 @@ class Client(Connection):
             print('Session disconnection timeout. Force close.')
 
 
-class CLI(Thread):
+class CLI(LifecycleRun, Thread):
     
-    cli_registry = Registry[Callable[[Any, str], None]]('cli_registry')
+    cli_registry = Registry[ActionFunc]('cli_registry')
     
     def __init__(
         self,
@@ -160,7 +179,14 @@ class CLI(Thread):
         self.session_files = session_files
         self.client_cli_comm = client_cli_comm
     
-    def run(self):
+    #
+    # Running operations.
+    #
+    
+    def before_running(self) -> bool:
+        return True
+    
+    def running(self):
         comm = self.client_cli_comm
         while True:
             try:
@@ -172,14 +198,18 @@ class CLI(Thread):
                     self.wait_server_cmd(msg)
                     comm.command_running.clear()
                     comm.command_terminate.clear()
-                if comm.terminate.is_set():
-                    break
             except CLITerminate:
                 return
             except EOFError:
                 pass
             except:
                 traceback.print_exc()
+            
+            if comm.terminate.is_set():
+                return
+    
+    def after_running(self):
+        return
     
     def process_cmd(self, cmd: str) -> Union[Message, bool]:
         """
