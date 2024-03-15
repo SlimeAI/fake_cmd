@@ -4,34 +4,52 @@ Parallel utils.
 import os
 from threading import RLock, Thread, Event
 from abc import ABC, abstractmethod
+from slime_core.utils.base import BaseList
 from slime_core.utils.typing import (
     List,
     Union,
     TYPE_CHECKING,
-    Callable
+    Callable,
+    Iterable
 )
 from . import polling
 if TYPE_CHECKING:
     from file_comm.core.server import Command
 
 
-class CommandWatchdog(Thread):
+ExitCallbackFunc = Callable[[], None]
+
+
+class ExitCallbacks:
+    
+    def __init__(
+        self,
+        callbacks: Union[Iterable[ExitCallbackFunc], None] = None
+    ) -> None:
+        self.exit_callbacks__ = BaseList(callbacks)
+    
+    def run_exit_callbacks__(self):
+        for callback in self.exit_callbacks__:
+            callback()
+
+
+class CommandWatchdog(ExitCallbacks, Thread):
     """
     Run ``terminate_func`` after the ``command`` terminates.
     """
     def __init__(
         self,
         cmd: "Command",
-        terminate_func: Callable[[], None]
+        exit_callbacks: Union[Iterable[ExitCallbackFunc], None] = None
     ) -> None:
+        ExitCallbacks.__init__(self, exit_callbacks)
         Thread.__init__(self)
         self.cmd = cmd
-        self.terminate_func = terminate_func
     
     def run(self) -> None:
         self.cmd.start()
         self.cmd.join()
-        self.terminate_func()
+        self.run_exit_callbacks__()
 
 
 class CommandPool:
@@ -80,7 +98,10 @@ class CommandPool:
                         except ValueError:
                             pass
                 
-                watch = CommandWatchdog(cmd, terminate_func)
+                watch = CommandWatchdog(
+                    cmd,
+                    exit_callbacks=[terminate_func]
+                )
                 self.execute.append(watch)
                 watch.start()
     
@@ -99,7 +120,7 @@ class CommandPool:
             self.queue.append(command)
             queued = (len(self.queue) + len(self.execute)) > self.max_threads
             if queued:
-                command.queued.set()
+                command.command_state.queued.set()
                 command.info_queued()
             return (not queued)
     
@@ -114,11 +135,11 @@ class CommandPool:
             return True
 
 
-class LifecycleRun(ABC):
+class LifecycleRun(ExitCallbacks, ABC):
     """
     Separate the running process into ``before_running``, 
     ``running`` and ``after_running``.
-    """    
+    """
     def run(self):
         """
         This method may not be overridden.
@@ -127,6 +148,7 @@ class LifecycleRun(ABC):
             try:
                 self.running()
             finally:
+                self.run_exit_callbacks__()
                 self.after_running()
     
     @abstractmethod

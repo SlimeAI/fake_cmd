@@ -26,7 +26,7 @@ from file_comm.utils.parallel import (
 from file_comm.utils import (
     polling
 )
-from . import ServerFiles, SessionFiles, ActionFunc, dispatch_action
+from . import SessionInfo, ActionFunc, dispatch_action
 
 CLIENT_NOTE = """
 NOTE: enter ``exit`` to shutdown the client.
@@ -34,7 +34,7 @@ NOTE: Use ``Ctrl+C`` AND ``Ctrl+D`` to start a new line.
 """
 
 
-class ClientCLIComm:
+class State:
     """
     Communication items between client and cli.
     """
@@ -52,20 +52,18 @@ class Client(LifecycleRun, Connection):
     client_registry = Registry[ActionFunc]('client_registry')
     
     def __init__(self, address: str) -> None:
-        self.address = address
-        self.session_id = str(uuid.uuid1())
-        self.server_files = ServerFiles(address)
-        self.session_files = SessionFiles(address, self.session_id)
+        LifecycleRun.__init__(self)
+        # Create a new session id.
+        session_id = str(uuid.uuid1())
+        self.session_info = SessionInfo(address, session_id)
         self.heartbeat = Heartbeat(
-            self.session_files.heartbeat_client_fp,
-            self.session_files.heartbeat_server_fp
+            self.session_info.heartbeat_client_fp,
+            self.session_info.heartbeat_server_fp
         )
-        self.client_cli_comm = ClientCLIComm()
+        self.state = State()
         self.cli = CLI(
-            self.session_id,
-            self.server_files,
-            self.session_files,
-            self.client_cli_comm
+            self.session_info,
+            self.state
         )
     
     #
@@ -76,11 +74,14 @@ class Client(LifecycleRun, Connection):
         return self.connect()
     
     def running(self):
-        print(f'Connect with server: {self.address}. Session id: {self.session_id}.')
+        address = self.session_info.address
+        session_id = self.session_info.session_id
+        
+        print(f'Connect with server: {address}. Session id: {session_id}.')
         print(CLIENT_NOTE.strip('\n'))
         
-        comm = self.client_cli_comm
-        disconn_client_fp = self.session_files.disconn_client_fp
+        state = self.state
+        disconn_client_fp = self.session_info.disconn_client_fp
         to_be_destroyed = False
         # Start the CLI.
         self.cli.start()
@@ -96,10 +97,7 @@ class Client(LifecycleRun, Connection):
                         to_be_destroyed = True
                         self.disconnect(initiator=(not disconn))
                     
-                    msg = pop_message(
-                        self.session_files.client_fp,
-                        self.session_files.session_path
-                    )
+                    msg = pop_message(self.session_info.client_fp)
                     if to_be_destroyed and not msg:
                         # Directly return.
                         return
@@ -114,8 +112,8 @@ class Client(LifecycleRun, Connection):
                         action(self, msg)
             except KeyboardInterrupt:
                 print('Keyboard Interrupt.')
-                if comm.command_running.is_set():
-                    comm.command_terminate.set()
+                if state.command_running.is_set():
+                    state.command_terminate.set()
             except:
                 traceback.print_exc()
     
@@ -130,34 +128,40 @@ class Client(LifecycleRun, Connection):
         """
         Destroy before exit.
         """
-        self.client_cli_comm.terminate.set()
-        remove_file(self.session_files.client_fp, remove_lockfile=True)
+        self.state.terminate.set()
+        remove_file(self.session_info.client_fp, remove_lockfile=True)
     
     def connect(self) -> bool:
+        address = self.session_info.address
+        session_id = self.session_info.session_id
+        
         if not send_message(
-            self.server_files.main_fp,
-            Message(type='new_session', session_id=self.session_id),
-            self.address
+            Message(
+                session_id=session_id,
+                target_fp=self.session_info.main_fp,
+                confirm_namespace=address,
+                type='new_session'
+            )
         ):
             return False
         if not wait_symbol(
-            self.session_files.conn_client_fp,
+            self.session_info.conn_client_fp,
             remove_lockfile=True
         ):
             print(
-                f'Warning: server connection establishment failed. Server address: {self.address}.'
-                f'Session id: {self.session_id}.'
+                f'Warning: server connection establishment failed. Server address: {address}.'
+                f'Session id: {session_id}.'
             )
             return False
-        create_symbol(self.session_files.conn_server_fp)
+        create_symbol(self.session_info.conn_server_fp)
         return True
     
     def disconnect(self, initiator: bool):
-        disconn_server_fp = self.session_files.disconn_server_fp
-        disconn_client_fp = self.session_files.disconn_client_fp
+        disconn_server_fp = self.session_info.disconn_server_fp
+        disconn_client_fp = self.session_info.disconn_client_fp
         create_symbol(disconn_server_fp)
         if not initiator or wait_symbol(disconn_client_fp):
-            print(f'Successfully disconnect session: {self.session_id}.')
+            print(f'Successfully disconnect session: {self.session_info.session_id}.')
         else:
             print('Session disconnection timeout. Force close.')
 
@@ -168,16 +172,13 @@ class CLI(LifecycleRun, Thread):
     
     def __init__(
         self,
-        session_id: str,
-        server_files: ServerFiles,
-        session_files: SessionFiles,
-        client_cli_comm: ClientCLIComm
+        session_info: SessionInfo,
+        state: State
     ):
+        LifecycleRun.__init__(self)
         Thread.__init__(self)
-        self.session_id = session_id
-        self.server_files = server_files
-        self.session_files = session_files
-        self.client_cli_comm = client_cli_comm
+        self.session_info = session_info
+        self.state = state
     
     #
     # Running operations.
@@ -187,17 +188,17 @@ class CLI(LifecycleRun, Thread):
         return True
     
     def running(self):
-        comm = self.client_cli_comm
+        state = self.state
         while True:
             try:
                 cmd = input('[fake_cmd] ')
                 msg = self.process_cmd(cmd)
                 if msg:
-                    comm.command_running.set()
-                    comm.command_terminate.clear()
+                    state.command_running.set()
+                    state.command_terminate.clear()
                     self.wait_server_cmd(msg)
-                    comm.command_running.clear()
-                    comm.command_terminate.clear()
+                    state.command_running.clear()
+                    state.command_terminate.clear()
             except CLITerminate:
                 return
             except EOFError:
@@ -205,7 +206,7 @@ class CLI(LifecycleRun, Thread):
             except:
                 traceback.print_exc()
             
-            if comm.terminate.is_set():
+            if state.terminate.is_set():
                 return
     
     def after_running(self):
@@ -231,16 +232,15 @@ class CLI(LifecycleRun, Thread):
         """
         Send the command to the server.
         """
+        session_id = self.session_info.session_id
         msg = Message(
-            session_id=self.session_id,
+            session_id=session_id,
+            target_fp=self.session_info.server_fp,
+            confirm_namespace=self.session_info.session_namespace,
             type=type,
             content=cmd
         )
-        res = send_message(
-            self.session_files.server_fp,
-            msg,
-            self.session_files.session_path
-        )
+        res = send_message(msg)
         if not res:
             return False
         return msg
@@ -249,10 +249,10 @@ class CLI(LifecycleRun, Thread):
         """
         Wait the server command to finish.
         """
-        output_fp = self.session_files.message_output_fp(msg)
-        terminate_server_fp = self.session_files.command_terminate_server_fp(msg)
-        terminate_client_fp = self.session_files.command_terminate_client_fp(msg)
-        comm = self.client_cli_comm
+        output_fp = self.session_info.message_output_fp(msg)
+        terminate_server_fp = self.session_info.command_terminate_server_fp(msg)
+        terminate_client_fp = self.session_info.command_terminate_client_fp(msg)
+        state = self.state
         
         def redirect_output():
             """
@@ -274,10 +274,10 @@ class CLI(LifecycleRun, Thread):
                 break
             
             redirect_output()
-            if comm.terminate.is_set():
+            if state.terminate.is_set():
                 break
             
-            if comm.command_terminate.is_set():
+            if state.command_terminate.is_set():
                 print(
                     f'Terminating server command: {msg.content}.'
                 )
