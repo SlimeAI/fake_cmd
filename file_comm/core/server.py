@@ -260,6 +260,7 @@ class Session(LifecycleRun, Thread, Connection):
             
             if running_cmd.cmd_id == cmd_id:
                 running_cmd.cmd_state.terminate_remote.set()
+                # TODO: how to handle queued command ?
             else:
                 send_message_to_client(
                     self.session_info,
@@ -360,12 +361,18 @@ class Command(LifecycleRun, Thread):
         if cmd_state.finished.is_set():
             send_message_to_client(
                 session_info,
-                type='cmd_finished'
+                type='cmd_finished',
+                content=self.cmd_id
             )
         elif cmd_state.terminate_local.is_set():
             send_message_to_client(
                 session_info,
-                type='cmd_terminated'
+                type='cmd_terminated',
+                content=self.cmd_id
+            )
+        elif cmd_state.terminate_remote.is_set():
+            create_symbol(
+                self.session_info.command_terminate_confirm_fp(self.msg)
             )
     
     #

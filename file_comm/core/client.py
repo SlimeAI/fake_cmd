@@ -142,6 +142,14 @@ class Client(LifecycleRun, Connection):
     def process_info(self, msg: Message):
         print(msg.content)
     
+    @client_registry(key='cmd_finished')
+    def process_cmd_finished(self, msg: Message):
+        self.state.cmd_finished.set()
+    
+    @client_registry(key='cmd_terminated')
+    def process_cmd_terminated(self, msg: Message):
+        self.state.cmd_terminate_remote.set()
+    
     def connect(self) -> bool:
         address = self.session_info.address
         session_id = self.session_info.session_id
@@ -305,6 +313,15 @@ class CLI(LifecycleRun, Thread):
                     type='terminate_cmd',
                     content=msg.msg_id
                 )
+                if wait_symbol(
+                    self.session_info.command_terminate_confirm_fp(msg)
+                ):
+                    print(
+                        f'Command successfully terminated.'
+                    )
+                else:
+                    # TODO: non-block, but warning.
+                    pass
                 to_be_terminated = True
         
         # Remove all files.

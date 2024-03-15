@@ -96,6 +96,12 @@ class SessionInfo(ServerInfo, ReadonlyAttr):
         Get the message output file path.
         """
         return self.concat_session_fp(msg.output_fname)
+    
+    def command_terminate_confirm_fp(self, msg: Message) -> str:
+        """
+        Get the command terminate confirm fp.
+        """
+        return self.concat_session_fp(msg.msg_id)
 
 
 ActionFunc = Callable[[Any, Message], None]
