@@ -234,6 +234,14 @@ class Connection(ABC):
 
     @abstractmethod
     def disconnect(self, initiator: bool): pass
+    
+    @abstractmethod
+    def check_connection(self) -> bool:
+        """
+        Check the connection state, decide whether to exit 
+        and perform corresponding exit operations.
+        """
+        pass
 
 
 class Heartbeat:

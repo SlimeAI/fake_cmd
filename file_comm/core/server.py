@@ -36,7 +36,7 @@ from . import ServerInfo, SessionInfo, dispatch_action, ActionFunc
 class SessionState:
     
     def __init__(self) -> None:
-        self.destroy = Event()
+        self.destroy_local = Event()
 
 
 class CommandState:
@@ -50,23 +50,29 @@ class CommandState:
         self.finished = Event()
         # Command is queued.
         self.queued = Event()
+    
+    @property
+    def pending_terminate(self) -> bool:
+        return (
+            self.terminate_local.is_set() or 
+            self.terminate_remote.is_set()
+        )
 
 
 def send_message_to_client(
     session_info: SessionInfo,
     *,
     type: str,
-    content: str
+    content: Union[str, None] = None
 ):
-    send_message(
-        Message(
-            session_id=session_info.session_id,
-            target_fp=session_info.client_fp,
-            confirm_namespace=session_info.session_namespace,
-            type=type,
-            content=content
-        )
+    msg = Message(
+        session_id=session_info.session_id,
+        target_fp=session_info.client_fp,
+        confirm_namespace=session_info.session_namespace,
+        type=type,
+        content=content
     )
+    return (msg, send_message(msg))
 
 
 class Server(LifecycleRun):
@@ -82,7 +88,7 @@ class Server(LifecycleRun):
         LifecycleRun.__init__(self)
         self.server_info = ServerInfo(address)
         self.session_dict: Dict[str, Session] = {}
-        self.command_pool = CommandPool(max_commands)
+        self.cmd_pool = CommandPool(max_commands)
         # file initialization
         self.server_info.init_server()
         print(f'Server initialized. Address {address} created.')
@@ -108,8 +114,8 @@ class Server(LifecycleRun):
     def after_running(self):
         print('Server shutting down...')
         for session in self.session_dict.values():
-            session.session_state.destroy.set()
-        self.command_pool.pool_close.set()
+            session.session_state.destroy_local.set()
+        self.cmd_pool.pool_close.set()
     
     @action_registry(key='new_session')
     def create_new_session(self, msg: Message):
@@ -123,7 +129,7 @@ class Server(LifecycleRun):
         
         session = Session(
             SessionInfo(self.server_info.address, session_id),
-            self.command_pool,
+            self.cmd_pool,
             exit_callbacks=[destroy_session_func]
         )
         if session_id in self.session_dict:
@@ -145,7 +151,7 @@ class Server(LifecycleRun):
             return
         session = self.session_dict[session_id]
         state = session.session_state
-        state.destroy.set()
+        state.destroy_local.set()
     
     def pop_session_dict(self, session_id: str):
         return self.session_dict.pop(session_id, None)
@@ -162,13 +168,13 @@ class Session(LifecycleRun, Thread, Connection):
     def __init__(
         self,
         session_info: SessionInfo,
-        command_pool: CommandPool,
+        cmd_pool: CommandPool,
         exit_callbacks: Union[Iterable[ExitCallbackFunc], None] = None
     ) -> None:
         LifecycleRun.__init__(self, exit_callbacks)
         Thread.__init__(self)
         self.session_info = session_info
-        self.command_pool = command_pool
+        self.cmd_pool = cmd_pool
         self.session_state = SessionState()
         self.heartbeat = Heartbeat(
             self.session_info.heartbeat_server_fp,
@@ -191,19 +197,11 @@ class Session(LifecycleRun, Thread, Connection):
         to_be_destroyed = False
         server_fp = self.session_info.server_fp
         session_id = self.session_info.session_id
-        disconn_server_fp = self.session_info.disconn_server_fp
         action_registry = self.action_registry
-        session_state = self.session_state
         
         for _ in polling():
-            disconn = check_symbol(disconn_server_fp)
-            if (
-                session_state.destroy.is_set() or 
-                not self.heartbeat.beat() or 
-                disconn
-            ):
-                to_be_destroyed = True
-                self.disconnect(initiator=(not disconn))
+            if not to_be_destroyed:
+                to_be_destroyed = (not self.check_connection())
             
             msg = pop_message(server_fp)
             if to_be_destroyed and not msg:
@@ -219,7 +217,11 @@ class Session(LifecycleRun, Thread, Connection):
                 action(self, msg)
     
     def after_running(self):
-        self.destroy()
+        with self.running_cmd_lock:
+            running_cmd = self.running_cmd
+            if running_cmd:
+                # Cancel queued command.
+                self.cmd_pool.cancel(running_cmd)
     
     #
     # Actions.
@@ -228,7 +230,7 @@ class Session(LifecycleRun, Thread, Connection):
     @action_registry(key='cmd')
     def run_new_cmd(self, msg: Message):
         def terminate_command_func():
-            self.command_pool.cancel(cmd)
+            self.cmd_pool.cancel(cmd)
             self.reset_running_cmd()
         
         cmd = ShellCommand(
@@ -236,7 +238,17 @@ class Session(LifecycleRun, Thread, Connection):
             self.session_info,
             exit_callbacks=[terminate_command_func]
         )
-        self.command_pool.submit(cmd)
+        self.cmd_pool.submit(cmd)
+        with self.running_cmd_lock:
+            if self.running_cmd:
+                # TODO: inconsistency occurred.
+                send_message_to_client(
+                    self.session_info,
+                    type='info',
+                    content='Another command is running.'
+                )
+            else:
+                self.running_cmd = cmd
     
     @action_registry(key='terminate_cmd')
     def terminate_cmd(self, msg: Message):
@@ -247,7 +259,7 @@ class Session(LifecycleRun, Thread, Connection):
                 return
             
             if running_cmd.cmd_id == cmd_id:
-                running_cmd.command_state.terminate_remote.set()
+                running_cmd.cmd_state.terminate_remote.set()
             else:
                 send_message_to_client(
                     self.session_info,
@@ -258,20 +270,6 @@ class Session(LifecycleRun, Thread, Connection):
                         f'{running_cmd.cmd_id}'
                     )
                 )
-    
-    def destroy(self):
-        """
-        Destroy operations.
-        """
-        with self.running_cmd_lock:
-            running_cmd = self.running_cmd
-            if running_cmd:
-                command_state = running_cmd.command_state
-                # Set the running_cmd to terminate.
-                command_state.terminate_local.set()
-                if not running_cmd.is_alive():
-                    # Manually terminate.
-                    running_cmd.terminate()
     
     def set_running_cmd(self, running_cmd: Union["Command", None]):
         with self.running_cmd_lock:
@@ -301,6 +299,27 @@ class Session(LifecycleRun, Thread, Connection):
             print(f'Successfully disconnect session: {self.session_info.session_id}.')
         else:
             print('Session disconnection timeout. Force close.')
+    
+    def check_connection(self) -> bool:
+        disconn_server_fp = self.session_info.disconn_server_fp
+        session_state = self.session_state
+        
+        with self.running_cmd_lock:
+            running_cmd = self.running_cmd
+            if check_symbol(disconn_server_fp):
+                self.disconnect(initiator=False)
+                if running_cmd:
+                    running_cmd.cmd_state.terminate_remote.set()
+                return False
+            elif (
+                session_state.destroy_local.is_set() or 
+                not self.heartbeat.beat()
+            ):
+                self.disconnect(initiator=True)
+                if running_cmd:
+                    running_cmd.cmd_state.terminate_local.set()
+                return False
+        return True
 
 
 class Command(LifecycleRun, Thread):
@@ -316,7 +335,7 @@ class Command(LifecycleRun, Thread):
         self.msg = msg
         self.session_info = session_info
         self.process = NOTHING
-        self.command_state = CommandState()
+        self.cmd_state = CommandState()
     
     @property
     def cmd_id(self) -> str:
@@ -332,13 +351,22 @@ class Command(LifecycleRun, Thread):
     
     def before_running(self) -> bool:
         self.info_running()
+        self.cmd_state.queued.clear()
         return True
     
     def after_running(self):
-        self.terminate()
-    
-    def terminate(self):
-        self.command_state.terminate_local.set()
+        cmd_state = self.cmd_state
+        session_info = self.session_info
+        if cmd_state.finished.is_set():
+            send_message_to_client(
+                session_info,
+                type='cmd_finished'
+            )
+        elif cmd_state.terminate_local.is_set():
+            send_message_to_client(
+                session_info,
+                type='cmd_terminated'
+            )
     
     #
     # Client info.
@@ -348,21 +376,19 @@ class Command(LifecycleRun, Thread):
         """
         Notify the client that the command is running.
         """
-        queued = self.command_state.queued
-        if queued.is_set():
+        if self.cmd_state.queued.is_set():
             # Notify only when it is queued.
             send_message_to_client(
                 self.session_info,
                 type='info',
                 content=f'Command {self.msg.msg_id} running...'
             )
-        queued.clear()
     
     def info_queued(self):
         """
         Notify the client that the command is queued.
         """
-        if self.command_state.queued.is_set():
+        if self.cmd_state.queued.is_set():
             send_message_to_client(
                 self.session_info,
                 type='info',
@@ -375,7 +401,7 @@ class ShellCommand(Command):
     def running(self) -> None:
         msg = self.msg
         output_fp = self.output_fp
-        state = self.command_state
+        state = self.cmd_state
         
         with LockedTextIO(
             open(output_fp, 'a'), output_fp
@@ -393,6 +419,8 @@ class ShellCommand(Command):
                 ):
                     self.process.kill()
                     return
+        # Normally finished.
+        state.finished.set()
 
 
 class InnerCommand(Command):

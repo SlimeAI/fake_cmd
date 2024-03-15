@@ -15,7 +15,6 @@ from file_comm.utils.comm import (
     create_symbol,
     pop_message,
     check_symbol,
-    remove_symbol,
     Heartbeat
 )
 from file_comm.utils.file import pop_all, remove_file
@@ -40,11 +39,37 @@ class State:
     """
     def __init__(self) -> None:
         # Indicator that whether a command is running.
-        self.command_running = Event()
-        # Keyboard Interrupt from the main Thread.
-        self.command_terminate = Event()
+        self.cmd_running = Event()
+        # Command terminate from local.
+        self.cmd_terminate_local = Event()
+        # Command terminated from remote.
+        self.cmd_terminate_remote = Event()
+        # Command finished.
+        self.cmd_finished = Event()
         # CLI terminate indicator.
         self.terminate = Event()
+    
+    def reset(self) -> None:
+        self.cmd_running.clear()
+        self.cmd_terminate_local.clear()
+        self.cmd_terminate_remote.clear()
+        self.cmd_finished.clear()
+
+
+def send_message_to_server(
+    session_info: SessionInfo,
+    *,
+    type: str,
+    content: Union[str, None] = None
+):
+    msg = Message(
+        session_id=session_info.session_id,
+        target_fp=session_info.server_fp,
+        confirm_namespace=session_info.session_namespace,
+        type=type,
+        content=content
+    )
+    return (msg, send_message(msg))
 
 
 class Client(LifecycleRun, Connection):
@@ -81,21 +106,14 @@ class Client(LifecycleRun, Connection):
         print(CLIENT_NOTE.strip('\n'))
         
         state = self.state
-        disconn_client_fp = self.session_info.disconn_client_fp
         to_be_destroyed = False
         # Start the CLI.
         self.cli.start()
         while True:
             try:
                 for _ in polling():
-                    disconn = check_symbol(disconn_client_fp)
-                    if (
-                        not self.heartbeat.beat() or 
-                        disconn or 
-                        not self.cli.is_alive()
-                    ):
-                        to_be_destroyed = True
-                        self.disconnect(initiator=(not disconn))
+                    if not to_be_destroyed:
+                        to_be_destroyed = (not self.check_connection())
                     
                     msg = pop_message(self.session_info.client_fp)
                     if to_be_destroyed and not msg:
@@ -112,24 +130,17 @@ class Client(LifecycleRun, Connection):
                         action(self, msg)
             except KeyboardInterrupt:
                 print('Keyboard Interrupt.')
-                if state.command_running.is_set():
-                    state.command_terminate.set()
+                if state.cmd_running.is_set():
+                    state.cmd_terminate_local.set()
             except:
                 traceback.print_exc()
     
     def after_running(self):
-        self.destroy()
+        remove_file(self.session_info.client_fp, remove_lockfile=True)
     
     @client_registry(key='info')
     def process_info(self, msg: Message):
         print(msg.content)
-    
-    def destroy(self):
-        """
-        Destroy before exit.
-        """
-        self.state.terminate.set()
-        remove_file(self.session_info.client_fp, remove_lockfile=True)
     
     def connect(self) -> bool:
         address = self.session_info.address
@@ -164,6 +175,24 @@ class Client(LifecycleRun, Connection):
             print(f'Successfully disconnect session: {self.session_info.session_id}.')
         else:
             print('Session disconnection timeout. Force close.')
+    
+    def check_connection(self) -> bool:
+        disconn_client_fp = self.session_info.disconn_client_fp
+        # Disconnection from remote.
+        if check_symbol(disconn_client_fp):
+            self.disconnect(initiator=False)
+            self.state.cmd_terminate_remote.set()
+            self.state.terminate.set()
+            return False
+        elif (
+            not self.heartbeat.beat() or 
+            not self.cli.is_alive()
+        ):
+            self.disconnect(initiator=True)
+            self.state.cmd_terminate_local.set()
+            self.state.terminate.set()
+            return False
+        return True
 
 
 class CLI(LifecycleRun, Thread):
@@ -194,11 +223,10 @@ class CLI(LifecycleRun, Thread):
                 cmd = input('[fake_cmd] ')
                 msg = self.process_cmd(cmd)
                 if msg:
-                    state.command_running.set()
-                    state.command_terminate.clear()
+                    state.reset()
+                    state.cmd_running.set()
                     self.wait_server_cmd(msg)
-                    state.command_running.clear()
-                    state.command_terminate.clear()
+                    state.reset()
             except CLITerminate:
                 return
             except EOFError:
@@ -232,15 +260,11 @@ class CLI(LifecycleRun, Thread):
         """
         Send the command to the server.
         """
-        session_id = self.session_info.session_id
-        msg = Message(
-            session_id=session_id,
-            target_fp=self.session_info.server_fp,
-            confirm_namespace=self.session_info.session_namespace,
+        msg, res = send_message_to_server(
+            self.session_info,
             type=type,
             content=cmd
         )
-        res = send_message(msg)
         if not res:
             return False
         return msg
@@ -250,43 +274,54 @@ class CLI(LifecycleRun, Thread):
         Wait the server command to finish.
         """
         output_fp = self.session_info.message_output_fp(msg)
-        terminate_server_fp = self.session_info.command_terminate_server_fp(msg)
-        terminate_client_fp = self.session_info.command_terminate_client_fp(msg)
         state = self.state
         
-        def redirect_output():
-            """
-            Redirect the content of ``output_fp`` to the cli.
-            """
-            content = pop_all(output_fp)
-            if not content:
-                return
-            sys.stderr.write(content)
-            sys.stderr.flush()
-        
+        to_be_terminated = False
         for _ in polling():
-            if check_symbol(
-                terminate_client_fp,
-                remove_lockfile=True
+            if (
+                state.cmd_terminate_remote.is_set() or 
+                state.terminate.is_set() or 
+                state.cmd_finished.is_set()
             ):
                 # Clear the output before terminate.
-                redirect_output()
+                self.redirect_output(output_fp)
                 break
             
-            redirect_output()
-            if state.terminate.is_set():
+            has_output = self.redirect_output(output_fp)
+            if to_be_terminated and not has_output:
+                # No more output, directly break.
                 break
             
-            if state.command_terminate.is_set():
+            if (
+                (not to_be_terminated) and
+                state.cmd_terminate_local.is_set()
+            ):
+                # Terminate from local.
                 print(
                     f'Terminating server command: {msg.content}.'
                 )
-                # Notify the server to terminate.
-                create_symbol(terminate_server_fp)
-        # Remove all the files.
-        remove_symbol(terminate_client_fp, remove_lockfile=True)
+                send_message_to_server(
+                    self.session_info,
+                    type='terminate_cmd',
+                    content=msg.msg_id
+                )
+                to_be_terminated = True
+        
+        # Remove all files.
         remove_file(output_fp, remove_lockfile=True)
     
     @cli_registry(key='exit')
     def cli_exit(self, cmd: str):
         raise CLITerminate
+    
+    def redirect_output(self, fp: str) -> bool:
+        """
+        Redirect the content of ``fp`` to the cli. Return whether 
+        any content exists.
+        """
+        content = pop_all(fp)
+        if not content:
+            return False
+        sys.stderr.write(content)
+        sys.stderr.flush()
+        return True

@@ -79,17 +79,19 @@ class CommandPool:
     
     def schedule(self):
         """
-        Schedule new jobs.
+        Schedule new jobs (in batch).
         """
         with (
             self.queue_lock,
             self.execute_lock
         ):
-            if (
+            while (
                 self.queue and 
                 len(self.execute) < self.max_threads
             ):
                 cmd = self.queue.pop(0)
+                if cmd.cmd_state.pending_terminate:
+                    continue
                 
                 def terminate_func():
                     with self.execute_lock:
@@ -108,7 +110,7 @@ class CommandPool:
     def close(self):
         self.pool_close.set()
     
-    def submit(self, command: "Command") -> bool:
+    def submit(self, cmd: "Command") -> bool:
         """
         Submit a command and return whether the command will be executed 
         immediately.
@@ -117,11 +119,11 @@ class CommandPool:
             self.queue_lock,
             self.execute_lock
         ):
-            self.queue.append(command)
+            self.queue.append(cmd)
             queued = (len(self.queue) + len(self.execute)) > self.max_threads
             if queued:
-                command.command_state.queued.set()
-                command.info_queued()
+                cmd.cmd_state.queued.set()
+                cmd.info_queued()
             return (not queued)
     
     def cancel(self, command: "Command") -> bool:
