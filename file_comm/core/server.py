@@ -131,7 +131,7 @@ class Server(LifecycleRun):
             if action is not MISSING:
                 action(self, msg)
     
-    def after_running(self):
+    def after_running(self, *args):
         print('Server shutting down...')
         self.cmd_pool.pool_close.set()
         # Use a new tuple, because the ``exit_callback`` will pop 
@@ -153,7 +153,7 @@ class Server(LifecycleRun):
     def create_new_session(self, msg: Message):
         session_id = msg.session_id
         
-        def destroy_session_func():
+        def destroy_session_func(*args):
             """
             Passed to the session to call when destroy.
             """
@@ -214,7 +214,7 @@ class Session(LifecycleRun, Thread, Connection):
         )
         self.running_cmd: Union[Command, None] = None
         self.running_cmd_lock = RLock()
-        self.backstage_cmds = BackstageCommandList()
+        self.background_cmds = BackgroundCommandList()
         # file initialization
         self.session_info.init_session()
         print(f'Session {self.session_info.session_id} created.')
@@ -253,7 +253,7 @@ class Session(LifecycleRun, Thread, Connection):
             if action is not MISSING:
                 action(self, msg)
     
-    def after_running(self):
+    def after_running(self, *args):
         # Further confirm the command is terminated.
         self.safely_terminate_cmd(cause='destroy')
     
@@ -263,7 +263,7 @@ class Session(LifecycleRun, Thread, Connection):
     
     @action_registry(key='cmd')
     def run_new_cmd(self, msg: Message):
-        def terminate_command_func():
+        def terminate_command_func(*args):
             self.cmd_pool.cancel(cmd)
             self.reset_running_cmd()
         
@@ -277,10 +277,13 @@ class Session(LifecycleRun, Thread, Connection):
     
     @action_registry(key='inner_cmd')
     def run_inner_cmd(self, msg: Message):
+        def terminate_command_func(*args):
+            self.reset_running_cmd()
+        
         cmd = InnerCommand(
             self,
             msg,
-            exit_callbacks=[self.reset_running_cmd]
+            exit_callbacks=[terminate_command_func]
         )
         self.set_running_cmd(cmd)
         cmd.start()
@@ -306,8 +309,8 @@ class Session(LifecycleRun, Thread, Connection):
                     )
                 )
     
-    @action_registry(key='backstage_cmd')
-    def make_cmd_backstage(self, msg: Message):
+    @action_registry(key='background_cmd')
+    def make_cmd_background(self, msg: Message):
         cmd_id = msg.content
         with self.running_cmd_lock:
             running_cmd = self.running_cmd
@@ -320,13 +323,17 @@ class Session(LifecycleRun, Thread, Connection):
                     type='info',
                     content=(
                         f'Command running inconsistency occurred. '
-                        f'Requiring backstage from client: {cmd_id}. Actual running: '
+                        f'Requiring background from client: {cmd_id}. Actual running: '
                         f'{running_cmd.cmd_id}'
                     )
                 )
                 return
-            self.backstage_cmds.append(running_cmd)
+            self.background_cmds.append(running_cmd)
             self.reset_running_cmd()
+    
+    #
+    # Command operations.
+    #
     
     def safely_terminate_cmd(
         self,
@@ -396,12 +403,6 @@ class Session(LifecycleRun, Thread, Connection):
     def reset_running_cmd(self):
         self.set_running_cmd(None)
     
-    def clear_cache(self):
-        """
-        Clear the cached files.
-        """
-        pass
-    
     #
     # Connection operations.
     #
@@ -465,6 +466,21 @@ class Session(LifecycleRun, Thread, Connection):
                 self.disconnect(initiator=True)
                 return False
         return True
+    
+    #
+    # Other methods.
+    #
+    
+    def clear_cache(self):
+        """
+        Clear the cached files.
+        """
+        pass
+    
+    def to_str(self) -> str:
+        return (
+            f'Session(session_id={self.session_info.session_id})'
+        )
 
 
 class Command(LifecycleRun, Thread):
@@ -503,7 +519,7 @@ class Command(LifecycleRun, Thread):
         self.cmd_state.queued.clear()
         return True
     
-    def after_running(self):
+    def after_running(self, __exc_type=None, __exc_value=None, __traceback=None):
         cmd_state = self.cmd_state
         session_info = self.session_info
         # Priority: Remote > Local > Finished
@@ -529,6 +545,26 @@ class Command(LifecycleRun, Thread):
             # Doing nothing because the disconnect operations 
             # will automatically notify the client.
             pass
+        
+        if (
+            __exc_type or 
+            __exc_value or 
+            __traceback
+        ):
+            send_message_to_client(
+                session_info,
+                type='info',
+                content=(
+                    f'Command terminated with exception: {str(__exc_type)} - '
+                    f'{str(__exc_value)}. Command content: {self.msg.content}. '
+                    f'Command id: {self.cmd_id}.'
+                )
+            )
+            send_message_to_client(
+                session_info,
+                type='cmd_terminated',
+                content=self.cmd_id
+            )
         # Mark the command exits.
         cmd_state.exit.set()
     
@@ -558,6 +594,15 @@ class Command(LifecycleRun, Thread):
                 type='info',
                 content=f'Command {self.msg.cmd_id} being queued...'
             )
+    
+    #
+    # Other methods.
+    #
+    
+    def to_str(self) -> str:
+        return (
+            f'Command(cmd={self.msg.content}, cmd_id={self.msg.cmd_id})'
+        )
 
 
 class ShellCommand(Command):
@@ -609,14 +654,62 @@ class InnerCommand(Command):
         )
         if action is not MISSING:
             action(self, output_f)
-    
-    @inner_cmd_registry(key='check_backstage')
-    def check_backstage(self, output_f: LockedTextIO):
         
-        pass
+        state = self.cmd_state
+        if not state.pending_terminate:
+            state.finished.set()
+    
+    @inner_cmd_registry(key='ls-back')
+    def list_background(self, output_f: LockedTextIO):
+        background_cmds = self.session.background_cmds
+        if len(background_cmds) == 0:
+            output_f.print__(
+                'No background cmds available.'
+            )
+            return
+        output_f.print__('Background commands:')
+        for index, cmd in enumerate(background_cmds.update_and_get()):
+            output_f.print__(
+                f'{index}. {cmd.to_str()}'
+            )
+    
+    @inner_cmd_registry(key='ls-session')
+    def list_session(self, output_f: LockedTextIO):
+        sessions = tuple(self.session.server.session_dict.values())
+        if len(sessions) == 0:
+            # This may never be executed.
+            output_f.print__('No sessions running.')
+            return
+        output_f.print__('Sessions:')
+        for session in sessions:
+            output_f.print__(session.to_str())
+    
+    @inner_cmd_registry(key='ls-cmd')
+    def list_cmd(self, output_f: LockedTextIO):
+        cmd_pool = self.session.cmd_pool
+        with (
+            cmd_pool.queue_lock,
+            cmd_pool.execute_lock
+        ):
+            output_f.print__('Executing:')
+            if len(cmd_pool.execute) == 0:
+                output_f.print__('No executing.')
+            else:
+                for index, cmd in enumerate(cmd_pool.execute):
+                    output_f.print__(
+                        f'{index}. {cmd.cmd.to_str()}'
+                    )
+            output_f.print__('Queued:')
+            if len(cmd_pool.queue) == 0:
+                output_f.print__('No queued.')
+            else:
+                for index, cmd in enumerate(cmd_pool.queue):
+                    output_f.print__(
+                        f'{index}. {cmd.to_str()}'
+                    )
 
 
-class BackstageCommandList(BaseList[Command]):
+class BackgroundCommandList(BaseList[Command]):
     """
     Used to contain the commands that failed to terminate in time.
     """
@@ -647,3 +740,10 @@ class BackstageCommandList(BaseList[Command]):
                 lambda cmd: not cmd.cmd_state.exit.is_set(),
                 self.get_list__()
             )))
+
+    def update_and_get(self) -> "BackgroundCommandList":
+        """
+        Update command states and return self.
+        """
+        self.update_command_states__()
+        return self

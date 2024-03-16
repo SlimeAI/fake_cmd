@@ -2,6 +2,7 @@
 Parallel utils.
 """
 import os
+from types import TracebackType
 from threading import RLock, Thread, Event
 from abc import ABC, abstractmethod
 from slime_core.utils.base import BaseList
@@ -10,14 +11,22 @@ from slime_core.utils.typing import (
     Union,
     TYPE_CHECKING,
     Callable,
-    Iterable
+    Iterable,
+    Type
 )
 from . import polling, config
 if TYPE_CHECKING:
     from file_comm.core.server import Command
 
 
-ExitCallbackFunc = Callable[[], None]
+ExitCallbackFunc = Callable[
+    [
+        Union[Type[BaseException], None],
+        Union[BaseException, None],
+        Union[TracebackType, None]
+    ],
+    None
+]
 
 
 class ExitCallbacks:
@@ -28,9 +37,14 @@ class ExitCallbacks:
     ) -> None:
         self.exit_callbacks__ = BaseList(callbacks)
     
-    def run_exit_callbacks__(self):
+    def run_exit_callbacks__(
+        self,
+        __exc_type: Union[Type[BaseException], None] = None,
+        __exc_value: Union[BaseException, None] = None,
+        __traceback: Union[TracebackType, None] = None
+    ):
         for callback in self.exit_callbacks__:
-            callback()
+            callback(__exc_type, __exc_value, __traceback)
 
 
 class CommandWatchdog(ExitCallbacks, Thread):
@@ -99,7 +113,7 @@ class CommandPool:
                         # Double-check to make it safe.
                         continue
                 
-                    def terminate_func():
+                    def terminate_func(*args):
                         with self.execute_lock:
                             try:
                                 self.execute.remove(watch)
@@ -157,11 +171,22 @@ class LifecycleRun(ExitCallbacks, ABC):
         This method may not be overridden.
         """
         if self.before_running():
-            try:
+            with self:
                 self.running()
-            finally:
-                self.run_exit_callbacks__()
-                self.after_running()
+    
+    def __enter__(self): return self
+    
+    def __exit__(
+        self,
+        __exc_type: Union[Type[BaseException], None],
+        __exc_value: Union[BaseException, None],
+        __traceback: Union[TracebackType, None]
+    ):
+        """
+        Use exit to catch up exceptions and pass them to the functions.
+        """
+        self.run_exit_callbacks__(__exc_type, __exc_value, __traceback)
+        self.after_running(__exc_type, __exc_value, __traceback)
     
     @abstractmethod
     def running(self): pass
@@ -175,4 +200,9 @@ class LifecycleRun(ExitCallbacks, ABC):
         return True
     
     @abstractmethod
-    def after_running(self): pass
+    def after_running(
+        self,
+        __exc_type: Union[Type[BaseException], None] = None,
+        __exc_value: Union[BaseException, None] = None,
+        __traceback: Union[TracebackType, None] = None
+    ): pass

@@ -152,7 +152,7 @@ class Client(LifecycleRun, Connection):
             except:
                 traceback.print_exc()
     
-    def after_running(self):
+    def after_running(self, *args):
         remove_file(self.session_info.client_fp, remove_lockfile=True)
     
     #
@@ -167,7 +167,7 @@ class Client(LifecycleRun, Connection):
     def process_cmd_finished(self, msg: Message):
         cmd_id = msg.content
         if (
-            not self.cli.current_cmd or 
+            self.cli.current_cmd and 
             cmd_id != self.cli.current_cmd.cmd_id
         ):
             print(
@@ -179,7 +179,7 @@ class Client(LifecycleRun, Connection):
     def process_cmd_terminated(self, msg: Message):
         cmd_id = msg.content
         if (
-            not self.cli.current_cmd or 
+            self.cli.current_cmd and 
             cmd_id != self.cli.current_cmd.cmd_id
         ):
             print(
@@ -296,6 +296,10 @@ class CLI(LifecycleRun, Thread):
     def state(self) -> State:
         return self.client.state
     
+    def set_current_cmd(self, cmd: Union[CommandMessage, None]) -> None:
+        with self.current_cmd_lock:
+            self.current_cmd = cmd
+    
     #
     # Running operations.
     #
@@ -315,16 +319,17 @@ class CLI(LifecycleRun, Thread):
                         return
                 
                 cmd = input('[fake_cmd] ')
+                # NOTE: the state reset should be in front of the command sent 
+                # to the server.
+                state.reset()
+                # NOTE: the command has already been sent to the server here.
                 msg = self.process_cmd(cmd)
                 if msg:
-                    state.reset()
                     state.cmd_running.set()
-                    with self.current_cmd_lock:
-                        # Use lock to make the current cmd consistent.
-                        self.current_cmd = msg
-                        self.wait_server_cmd(msg)
-                        self.current_cmd = None
-                    state.reset()
+                    self.wait_server_cmd(msg)
+                    self.set_current_cmd(None)
+                # No matter what happened, reset the state for the next command.
+                state.reset()
             except CLITerminate:
                 return
             except EOFError:
@@ -332,7 +337,7 @@ class CLI(LifecycleRun, Thread):
             except:
                 traceback.print_exc()
     
-    def after_running(self):
+    def after_running(self, *args):
         return
     
     #
@@ -350,7 +355,7 @@ class CLI(LifecycleRun, Thread):
         
         cli_func = self.cli_registry.get(cmd, MISSING)
         if cli_func is MISSING:
-            return self.send_server_cmd(cmd)
+            return self.send_server_cmd(cmd, type='cmd')
         else:
             return cli_func(self, cmd)
     
@@ -358,14 +363,23 @@ class CLI(LifecycleRun, Thread):
         """
         Send the command to the server.
         """
-        msg, res = send_message_to_session(
-            self.session_info,
+        # NOTE: The message should be manually sent rather than use 
+        # ``send_message_to_session`` in order to keep consistent 
+        # with ``self.current_cmd``
+        session_info = self.session_info
+        msg = CommandMessage(
+            session_id=session_info.session_id,
+            target_fp=session_info.server_fp,
+            confirm_namespace=session_info.session_namespace,
             type=type,
             content=cmd
         )
+        self.set_current_cmd(msg)
+        res = send_message(msg)
         if not res:
+            self.set_current_cmd(None)
             return False
-        return CommandMessage.clone(msg)
+        return msg
     
     def wait_server_cmd(self, msg: CommandMessage):
         """
@@ -412,11 +426,11 @@ class CLI(LifecycleRun, Thread):
                 else:
                     print(
                         f'Warning: command may take more time to terminate, and '
-                        f'it is now put to the backstage.'
+                        f'it is now put to the background.'
                     )
                     send_message_to_session(
                         self.session_info,
-                        type='backstage_cmd',
+                        type='background_cmd',
                         content=msg.cmd_id
                     )
                 to_be_terminated = True
@@ -428,18 +442,20 @@ class CLI(LifecycleRun, Thread):
     def cli_exit(self, cmd: str):
         raise CLITerminate
     
+    @cli_registry(key='sid')
+    def cli_exit(self, cmd: str) -> bool:
+        print(
+            f'Session id: {self.session_info.session_id}'
+        )
+        return False
+    
     @cli_registry.register_multi([
-        'check_backstage'
+        'ls-back',
+        'ls-session',
+        'ls-cmd'
     ])
     def inner_cmd(self, cmd: str) -> Union[CommandMessage, bool]:
-        msg, res = send_message_to_session(
-            self.session_info,
-            type='inner_cmd',
-            content=cmd
-        )
-        if not res:
-            return False
-        return CommandMessage.clone(msg)
+        return self.send_server_cmd(cmd, type='inner_cmd')
     
     def redirect_output(self, fp: str) -> bool:
         """

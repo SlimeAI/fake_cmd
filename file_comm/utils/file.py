@@ -27,6 +27,9 @@ def file_lock(fp: str, remove_lockfile: bool = False):
     """
     Acquire a file lock. If ``fp`` does not exist, then create a new 
     file. Remove the lock file if ``remove_lockfile`` is ``True``.
+    
+    NOTE: ``file_lock`` acquired by different functions will be blocked, 
+    even the functions are called in the same process and the same thread.
     """
     lockfile_path = get_lockfile_path(fp)
     # The lock file should not be deleted to avoid inconsistency.
@@ -89,7 +92,10 @@ def pop_all(fp: str, remove: bool = False) -> str:
     with file_lock(fp), open(fp, 'r') as f:
         content = f.read()
         if remove:
-            remove_file(fp)
+            try:
+                os.remove(fp)
+            except FileNotFoundError:
+                pass
         else:
             # Clear the file.
             with open(fp, 'w'): pass
@@ -157,21 +163,28 @@ class LockedTextIO:
         self.attrs__ = {
             'write',
             'writelines',
-            'flush'
+            'flush',
+            'print__'
         }
+    
+    def print__(self, content: str):
+        """
+        Print content with automatic new line.
+        """
+        return self.write(f'{content}\n')
     
     def write(self, *args, **kwds):
         with file_lock(self.fp__):
             res = self.f__.write(*args, **kwds)
             # Use flush to make it consistent.
-            self.flush()
+            self.f__.flush()
             return res
     
     def writelines(self, *args, **kwds):
         with file_lock(self.fp__):
             res = self.f__.writelines(*args, **kwds)
             # Use flush to make it consistent.
-            self.flush()
+            self.f__.flush()
             return res
     
     def flush(self, *args, **kwds):
