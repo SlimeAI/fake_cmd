@@ -367,8 +367,15 @@ class CLI(LifecycleRun, Thread):
                         f'Command successfully terminated.'
                     )
                 else:
-                    # TODO: non-block, but warning.
-                    pass
+                    print(
+                        f'Warning: command may take more time to terminate, and '
+                        f'it is now put to the backstage.'
+                    )
+                    send_message_to_server(
+                        self.session_info,
+                        type='backstage_cmd',
+                        content=msg.msg_id
+                    )
                 to_be_terminated = True
         
         # Remove all files.

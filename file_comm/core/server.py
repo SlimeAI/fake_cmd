@@ -1,5 +1,6 @@
 from subprocess import Popen
 from threading import Thread, Event, RLock
+from slime_core.utils.base import BaseList
 from slime_core.utils.registry import Registry
 from slime_core.utils.typing import (
     MISSING,
@@ -50,8 +51,12 @@ class CommandState:
         self.terminate_remote = Event()
         # Terminate because of disconnection.
         self.terminate_disconnect = Event()
-        # Finished.
+        # Mark that the command normally finished.
         self.finished = Event()
+        # Mark that the command finally exit, whether through itself 
+        # or by manual termination (usually because the command is 
+        # terminated before being scheduled).
+        self.exit = Event()
         # Command is queued. Used only to decide whether to 
         # notify the client that the task is queued.
         self.queued = Event()
@@ -192,7 +197,7 @@ class Session(LifecycleRun, Thread, Connection):
         )
         self.running_cmd: Union[Command, None] = None
         self.running_cmd_lock = RLock()
-        
+        self.backstage_cmds = BackstageCommandList()
         # file initialization
         self.session_info.init_session()
         print(f'Session {self.session_info.session_id} created.')
@@ -249,11 +254,14 @@ class Session(LifecycleRun, Thread, Connection):
         self.cmd_pool.submit(cmd)
         with self.running_cmd_lock:
             if self.running_cmd:
-                # TODO: inconsistency occurred.
                 send_message_to_client(
                     self.session_info,
                     type='info',
-                    content='Another command is running.'
+                    content=(
+                        'Another command is running or has not been '
+                        'terminated, inconsistency occurred and the '
+                        'incoming command will be ignored.'
+                    )
                 )
             else:
                 self.running_cmd = cmd
@@ -278,6 +286,28 @@ class Session(LifecycleRun, Thread, Connection):
                         f'{running_cmd.cmd_id}'
                     )
                 )
+    
+    @action_registry(key='backstage_cmd')
+    def make_cmd_backstage(self, msg: Message):
+        cmd_id = msg.content
+        with self.running_cmd_lock:
+            running_cmd = self.running_cmd
+            if not running_cmd:
+                return
+            
+            if running_cmd.cmd_id != cmd_id:
+                send_message(
+                    self.session_info,
+                    type='info',
+                    content=(
+                        f'Command running inconsistency occurred. '
+                        f'Requiring backstage from client: {cmd_id}. Actual running: '
+                        f'{running_cmd.cmd_id}'
+                    )
+                )
+                return
+            self.backstage_cmds.append(running_cmd)
+            self.reset_running_cmd()
     
     def safely_terminate_cmd(
         self,
@@ -455,6 +485,8 @@ class Command(LifecycleRun, Thread):
             # Doing nothing because the disconnect operations 
             # will automatically notify the client.
             pass
+        # Mark the command exits.
+        cmd_state.exit.set()
     
     #
     # Client info.
@@ -514,3 +546,36 @@ class ShellCommand(Command):
 
 class InnerCommand(Command):
     pass
+
+
+class BackstageCommandList(BaseList[Command]):
+    """
+    Used to contain the commands that failed to terminate in time.
+    """
+    
+    def __init__(self):
+        super().__init__()
+        # Use a lock to make it safe.
+        self.lock = RLock()
+    
+    def __setitem__(self, __key, __value: Command):
+        with self.lock:
+            super().__setitem__(__key, __value)
+            self.update_command_states__()
+    
+    def __delitem__(self, __key):
+        with self.lock:
+            super().__delitem__(__key)
+            self.update_command_states__()
+    
+    def insert(self, __index, __object: Command):
+        with self.lock:
+            super().insert(__index, __object)
+            self.update_command_states__()
+
+    def update_command_states__(self):
+        with self.lock:
+            self.set_list__(list(filter(
+                lambda cmd: not cmd.cmd_state.exit.is_set(),
+                self.get_list__()
+            )))
