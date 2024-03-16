@@ -1,3 +1,4 @@
+import subprocess
 from subprocess import Popen
 from threading import Thread, Event, RLock
 from slime_core.utils.base import BaseList
@@ -9,7 +10,9 @@ from slime_core.utils.typing import (
     NOTHING,
     Iterable,
     Missing,
-    Literal
+    Literal,
+    Callable,
+    Any
 )
 from file_comm.utils.comm import (
     Connection,
@@ -20,7 +23,8 @@ from file_comm.utils.comm import (
     pop_message,
     check_symbol,
     Heartbeat,
-    send_message
+    send_message,
+    CommandMessage
 )
 from file_comm.utils.file import (
     LockedTextIO
@@ -31,7 +35,8 @@ from file_comm.utils.parallel import (
     ExitCallbackFunc
 )
 from file_comm.utils import (
-    polling
+    polling,
+    config
 )
 from . import ServerInfo, SessionInfo, dispatch_action, ActionFunc
 
@@ -78,7 +83,7 @@ def send_message_to_client(
     session_info: SessionInfo,
     *,
     type: str,
-    content: Union[str, None] = None
+    content: Union[str, dict, list, None] = None
 ):
     msg = Message(
         session_id=session_info.session_id,
@@ -128,9 +133,21 @@ class Server(LifecycleRun):
     
     def after_running(self):
         print('Server shutting down...')
-        for session in self.session_dict.values():
-            session.session_state.destroy_local.set()
         self.cmd_pool.pool_close.set()
+        # Use a new tuple, because the ``exit_callback`` will pop 
+        # the dict items.
+        sessions = tuple(self.session_dict.values())
+        for session in sessions:
+            session.session_state.destroy_local.set()
+        print('Waiting sessions to destroy...')
+        for session in sessions:
+            session.join(config.wait_timeout)
+        if any(map(lambda session: session.is_alive(), sessions)):
+            print(
+                'Warning: there are still sessions undestroyed. Ignoring and shutdown...'
+            )
+        else:
+            print('Successfully shutdown. Bye.')
     
     @action_registry(key='new_session')
     def create_new_session(self, msg: Message):
@@ -251,20 +268,18 @@ class Session(LifecycleRun, Thread, Connection):
             self.session_info,
             exit_callbacks=[terminate_command_func]
         )
+        self.set_running_cmd(cmd)
         self.cmd_pool.submit(cmd)
-        with self.running_cmd_lock:
-            if self.running_cmd:
-                send_message_to_client(
-                    self.session_info,
-                    type='info',
-                    content=(
-                        'Another command is running or has not been '
-                        'terminated, inconsistency occurred and the '
-                        'incoming command will be ignored.'
-                    )
-                )
-            else:
-                self.running_cmd = cmd
+    
+    @action_registry(key='inner_cmd')
+    def run_inner_cmd(self, msg: Message):
+        cmd = InnerCommand(
+            msg,
+            self.session_info,
+            exit_callbacks=[self.reset_running_cmd]
+        )
+        self.set_running_cmd(cmd)
+        cmd.start()
     
     @action_registry(key='terminate_cmd')
     def terminate_cmd(self, msg: Message):
@@ -349,9 +364,28 @@ class Session(LifecycleRun, Thread, Connection):
                 cmd.run_exit_callbacks__()
                 cmd.after_running()
     
-    def set_running_cmd(self, running_cmd: Union["Command", None]):
+    def set_running_cmd(self, running_cmd: Union["Command", None]) -> bool:
+        """
+        Return whether the set operation succeeded.
+        """
         with self.running_cmd_lock:
-            self.running_cmd = running_cmd
+            if (
+                not running_cmd and 
+                self.running_cmd
+            ):
+                send_message_to_client(
+                    self.session_info,
+                    type='info',
+                    content=(
+                        'Another command is running or has not been '
+                        'terminated, inconsistency occurred and the '
+                        'incoming command will be ignored.'
+                    )
+                )
+                return False
+            else:
+                self.running_cmd = running_cmd
+                return True
     
     def reset_running_cmd(self):
         self.set_running_cmd(None)
@@ -437,14 +471,14 @@ class Command(LifecycleRun, Thread):
     ):
         LifecycleRun.__init__(self, exit_callbacks)
         Thread.__init__(self)
-        self.msg = msg
+        self.msg = CommandMessage.clone(msg)
         self.session_info = session_info
         self.process = NOTHING
         self.cmd_state = CommandState()
     
     @property
     def cmd_id(self) -> str:
-        return self.msg.msg_id
+        return self.msg.cmd_id
     
     @property
     def output_fp(self) -> str:
@@ -501,7 +535,7 @@ class Command(LifecycleRun, Thread):
             send_message_to_client(
                 self.session_info,
                 type='info',
-                content=f'Command {self.msg.msg_id} running...'
+                content=f'Command {self.msg.cmd_id} running...'
             )
     
     def info_queued(self):
@@ -512,7 +546,7 @@ class Command(LifecycleRun, Thread):
             send_message_to_client(
                 self.session_info,
                 type='info',
-                content=f'Command {self.msg.msg_id} being queued...'
+                content=f'Command {self.msg.cmd_id} being queued...'
             )
 
 
@@ -526,9 +560,12 @@ class ShellCommand(Command):
         with LockedTextIO(
             open(output_fp, 'a'), output_fp
         ) as output_f:
+            # NOTE: should change ``stdin`` to avoid termination 
+            # by KeyboardInterrupt in cmd.
             self.process = Popen(
                 msg.content,
                 shell=True,
+                stdin=subprocess.PIPE,
                 stdout=output_f,
                 stderr=output_f
             )
@@ -540,12 +577,33 @@ class ShellCommand(Command):
                 ):
                     self.process.kill()
                     return
-        # Normally finished.
-        state.finished.set()
+        
+        if not state.pending_terminate:
+            # Normally finished.
+            state.finished.set()
 
 
 class InnerCommand(Command):
-    pass
+    
+    inner_cmd_registry = Registry[Callable[[Any, LockedTextIO], None]]('inner_cmd_registry')
+    
+    def running(self):
+        msg = self.msg
+        inner_cmd = msg.content
+        output_fp = self.output_fp
+        output_f = LockedTextIO(open(output_fp, 'a'), output_fp)
+        action = dispatch_action(
+            self.inner_cmd_registry,
+            inner_cmd,
+            f'Session inner command: {inner_cmd}. Session id: {self.session_info.session_id}'
+        )
+        if action is not MISSING:
+            action(self, output_f)
+    
+    @inner_cmd_registry(key='check_backstage')
+    def check_backstage(self, output_f: LockedTextIO):
+        
+        pass
 
 
 class BackstageCommandList(BaseList[Command]):

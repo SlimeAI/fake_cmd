@@ -34,8 +34,7 @@ class Message(ReadonlyAttr):
         'session_id',
         'msg_id',
         'target_fp',
-        'confirm_namespace',
-        'content_type'
+        'confirm_namespace'
     )
     
     json_attrs = (
@@ -45,8 +44,7 @@ class Message(ReadonlyAttr):
         'type',
         'content',
         'timestamp',
-        'msg_id',
-        'content_type'
+        'msg_id'
     )
     
     def __init__(
@@ -56,10 +54,9 @@ class Message(ReadonlyAttr):
         target_fp: str,
         confirm_namespace: str,
         type: str,
-        content: Union[str, None] = None,
+        content: Union[str, dict, list, None] = None,
         timestamp: Union[float, None] = None,
-        msg_id: Union[str, None] = None,
-        content_type: str = 'str'
+        msg_id: Union[str, None] = None
     ) -> None:
         """
         - ``session_id``: The connection session id.
@@ -70,7 +67,6 @@ class Message(ReadonlyAttr):
         - ``content``: The message content.
         - ``timestamp``: Time when the message is created.
         - ``msg_id``: A unique message id.
-        - ``content_type``: The type of the content (default to ``str``).
         """
         self.session_id = session_id
         self.target_fp = target_fp
@@ -79,7 +75,6 @@ class Message(ReadonlyAttr):
         self.content = content
         self.timestamp = timestamp or time.time()
         self.msg_id = msg_id or str(uuid.uuid4())
-        self.content_type = content_type
     
     @property
     def confirm_fname(self) -> str:
@@ -113,15 +108,33 @@ class Message(ReadonlyAttr):
         return json.dumps(kwds)
     
     @classmethod
-    def from_json(cls, json_str: str) -> "Message":
+    def from_json(cls, json_str: str):
         """
         Create a message object from json str.
         """
         kwds: Dict[str, Any] = json.loads(json_str)
         return cls(**{k:kwds.get(k, None) for k in cls.json_attrs})
 
+    @classmethod
+    def clone(cls, msg: "Message"):
+        return cls.from_json(msg.to_json())
+
     def __bool__(self) -> bool:
         return True
+
+
+class CommandMessage(Message):
+    """
+    Create alias names of the message attributes for better understanding.
+    """
+    
+    @property
+    def cmd_content(self) -> str:
+        return self.content
+    
+    @property
+    def cmd_id(self) -> str:
+        return self.msg_id
 
 
 def listen_messages(fp: str):

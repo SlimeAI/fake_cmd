@@ -8,7 +8,7 @@ from slime_core.utils.typing import (
     Callable,
     Any
 )
-from file_comm.utils.comm import Message
+from file_comm.utils.comm import Message, CommandMessage
 from file_comm.utils.file import create_empty_file
 
 
@@ -99,11 +99,11 @@ class SessionInfo(ServerInfo, ReadonlyAttr):
         """
         return self.concat_session_fp(msg.output_fname)
     
-    def command_terminate_confirm_fp(self, msg: Message) -> str:
+    def command_terminate_confirm_fp(self, msg: CommandMessage) -> str:
         """
         Get the command terminate confirm fp.
         """
-        return self.concat_session_fp(msg.msg_id)
+        return self.concat_session_fp(msg.cmd_id)
 
 
 ActionFunc = Callable[[Any, Message], None]

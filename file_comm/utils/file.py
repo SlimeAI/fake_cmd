@@ -162,11 +162,17 @@ class LockedTextIO:
     
     def write(self, *args, **kwds):
         with file_lock(self.fp__):
-            return self.f__.write(*args, **kwds)
+            res = self.f__.write(*args, **kwds)
+            # Use flush to make it consistent.
+            self.flush()
+            return res
     
     def writelines(self, *args, **kwds):
         with file_lock(self.fp__):
-            return self.f__.writelines(*args, **kwds)
+            res = self.f__.writelines(*args, **kwds)
+            # Use flush to make it consistent.
+            self.flush()
+            return res
     
     def flush(self, *args, **kwds):
         with file_lock(self.fp__):

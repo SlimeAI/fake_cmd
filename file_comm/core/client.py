@@ -5,7 +5,9 @@ from threading import Thread, Event, RLock
 from slime_core.utils.registry import Registry
 from slime_core.utils.typing import (
     MISSING,
-    Union
+    Union,
+    Callable,
+    Any
 )
 from file_comm.utils.comm import (
     Connection,
@@ -15,7 +17,8 @@ from file_comm.utils.comm import (
     create_symbol,
     pop_message,
     check_symbol,
-    Heartbeat
+    Heartbeat,
+    CommandMessage
 )
 from file_comm.utils.file import pop_all, remove_file
 from file_comm.utils.exception import CLITerminate
@@ -61,7 +64,23 @@ def send_message_to_server(
     session_info: SessionInfo,
     *,
     type: str,
-    content: Union[str, None] = None
+    content: Union[str, dict, list, None] = None
+):
+    msg = Message(
+        session_id=session_info.session_id,
+        target_fp=session_info.main_fp,
+        confirm_namespace=session_info.address,
+        type=type,
+        content=content
+    )
+    return (msg, send_message(msg))
+
+
+def send_message_to_session(
+    session_info: SessionInfo,
+    *,
+    type: str,
+    content: Union[str, dict, list, None] = None
 ):
     msg = Message(
         session_id=session_info.session_id,
@@ -149,10 +168,26 @@ class Client(LifecycleRun, Connection):
     
     @client_registry(key='cmd_finished')
     def process_cmd_finished(self, msg: Message):
+        cmd_id = msg.content
+        if (
+            not self.cli.current_cmd or 
+            cmd_id != self.cli.current_cmd.cmd_id
+        ):
+            print(
+                f'Warning: cmd inconsistency occurred.'
+            )
         self.state.cmd_finished.set()
     
     @client_registry(key='cmd_terminated')
     def process_cmd_terminated(self, msg: Message):
+        cmd_id = msg.content
+        if (
+            not self.cli.current_cmd or 
+            cmd_id != self.cli.current_cmd.cmd_id
+        ):
+            print(
+                f'Warning: cmd inconsistency occurred.'
+            )
         self.state.cmd_terminate_remote.set()
     
     #
@@ -163,14 +198,12 @@ class Client(LifecycleRun, Connection):
         address = self.session_info.address
         session_id = self.session_info.session_id
         
-        if not send_message(
-            Message(
-                session_id=session_id,
-                target_fp=self.session_info.main_fp,
-                confirm_namespace=address,
-                type='new_session'
-            )
-        ):
+        _, res = send_message_to_server(
+            self.session_info,
+            type='new_session'
+        )
+        
+        if not res:
             return False
         if not wait_symbol(
             self.session_info.conn_client_fp,
@@ -244,7 +277,7 @@ class Client(LifecycleRun, Connection):
 
 class CLI(LifecycleRun, Thread):
     
-    cli_registry = Registry[ActionFunc]('cli_registry')
+    cli_registry = Registry[Callable[[Any, str], Union[CommandMessage, bool]]]('cli_registry')
     
     def __init__(
         self,
@@ -255,6 +288,10 @@ class CLI(LifecycleRun, Thread):
         Thread.__init__(self)
         self.session_info = session_info
         self.state = state
+        self.current_cmd: Union[CommandMessage, None] = None
+        # Use a current cmd lock to make it consistent with 
+        # the current waiting server cmd.
+        self.current_cmd_lock = RLock()
     
     #
     # Running operations.
@@ -279,7 +316,11 @@ class CLI(LifecycleRun, Thread):
                 if msg:
                     state.reset()
                     state.cmd_running.set()
-                    self.wait_server_cmd(msg)
+                    with self.current_cmd_lock:
+                        # Use lock to make the current cmd consistent.
+                        self.current_cmd = msg
+                        self.wait_server_cmd(msg)
+                        self.current_cmd = None
                     state.reset()
             except CLITerminate:
                 return
@@ -295,10 +336,10 @@ class CLI(LifecycleRun, Thread):
     # Command operations.
     #
     
-    def process_cmd(self, cmd: str) -> Union[Message, bool]:
+    def process_cmd(self, cmd: str) -> Union[CommandMessage, bool]:
         """
-        Process the input cmd. Return a ``Message`` object if the cmd 
-        should be executed in the server and it is successfully received, 
+        Process the input cmd. Return a ``CommandMessage`` object if the 
+        cmd should be executed in the server and it is successfully received, 
         else return ``False``.
         """
         if not cmd:
@@ -308,23 +349,22 @@ class CLI(LifecycleRun, Thread):
         if cli_func is MISSING:
             return self.send_server_cmd(cmd)
         else:
-            cli_func(self, cmd)
-            return False
+            return cli_func(self, cmd)
     
-    def send_server_cmd(self, cmd: str, type: str = 'cmd') -> Union[Message, bool]:
+    def send_server_cmd(self, cmd: str, type: str = 'cmd') -> Union[CommandMessage, bool]:
         """
         Send the command to the server.
         """
-        msg, res = send_message_to_server(
+        msg, res = send_message_to_session(
             self.session_info,
             type=type,
             content=cmd
         )
         if not res:
             return False
-        return msg
+        return CommandMessage.clone(msg)
     
-    def wait_server_cmd(self, msg: Message):
+    def wait_server_cmd(self, msg: CommandMessage):
         """
         Wait the server command to finish.
         """
@@ -353,12 +393,12 @@ class CLI(LifecycleRun, Thread):
             ):
                 # Terminate from local.
                 print(
-                    f'Terminating server command: {msg.content}.'
+                    f'Terminating server command: {msg.cmd_content}.'
                 )
-                send_message_to_server(
+                send_message_to_session(
                     self.session_info,
                     type='terminate_cmd',
-                    content=msg.msg_id
+                    content=msg.cmd_id
                 )
                 if wait_symbol(
                     self.session_info.command_terminate_confirm_fp(msg)
@@ -371,10 +411,10 @@ class CLI(LifecycleRun, Thread):
                         f'Warning: command may take more time to terminate, and '
                         f'it is now put to the backstage.'
                     )
-                    send_message_to_server(
+                    send_message_to_session(
                         self.session_info,
                         type='backstage_cmd',
-                        content=msg.msg_id
+                        content=msg.cmd_id
                     )
                 to_be_terminated = True
         
@@ -384,6 +424,19 @@ class CLI(LifecycleRun, Thread):
     @cli_registry(key='exit')
     def cli_exit(self, cmd: str):
         raise CLITerminate
+    
+    @cli_registry.register_multi([
+        'check_backstage'
+    ])
+    def inner_cmd(self, cmd: str) -> Union[CommandMessage, bool]:
+        msg, res = send_message_to_session(
+            self.session_info,
+            type='inner_cmd',
+            content=cmd
+        )
+        if not res:
+            return False
+        return CommandMessage.clone(msg)
     
     def redirect_output(self, fp: str) -> bool:
         """
