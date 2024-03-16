@@ -48,6 +48,8 @@ class CommandState:
         self.terminate_local = Event()
         # Terminate from remote.
         self.terminate_remote = Event()
+        # Terminate because of disconnection.
+        self.terminate_disconnect = Event()
         # Finished.
         self.finished = Event()
         # Command is queued. Used only to decide whether to 
@@ -62,7 +64,8 @@ class CommandState:
     def pending_terminate(self) -> bool:
         return (
             self.terminate_local.is_set() or 
-            self.terminate_remote.is_set()
+            self.terminate_remote.is_set() or 
+            self.terminate_disconnect.is_set()
         )
 
 
@@ -189,6 +192,7 @@ class Session(LifecycleRun, Thread, Connection):
         )
         self.running_cmd: Union[Command, None] = None
         self.running_cmd_lock = RLock()
+        
         # file initialization
         self.session_info.init_session()
         print(f'Session {self.session_info.session_id} created.')
@@ -278,7 +282,7 @@ class Session(LifecycleRun, Thread, Connection):
     def safely_terminate_cmd(
         self,
         cmd: Union["Command", Missing] = MISSING,
-        cause: Literal['remote', 'local', 'destroy'] = 'remote'
+        cause: Literal['remote', 'local', 'destroy', 'disconnect'] = 'remote'
     ):
         """
         Safely terminate the cmd whether it is running, queued or finished. 
@@ -301,6 +305,8 @@ class Session(LifecycleRun, Thread, Connection):
                     cmd.cmd_state.terminate_remote.set()
                 elif cause == 'local':
                     cmd.cmd_state.terminate_local.set()
+                elif cause == 'disconnect':
+                    cmd.cmd_state.terminate_disconnect.set()
 
                 # If currently ``scheduled`` is not set, then it will never 
                 # be scheduled by the pool (because terminate state is set 
@@ -320,6 +326,16 @@ class Session(LifecycleRun, Thread, Connection):
     def reset_running_cmd(self):
         self.set_running_cmd(None)
     
+    def clear_cache(self):
+        """
+        Clear the cached files.
+        """
+        pass
+    
+    #
+    # Connection operations.
+    #
+    
     def connect(self) -> bool:
         create_symbol(self.session_info.conn_client_fp)
         if not wait_symbol(
@@ -335,12 +351,34 @@ class Session(LifecycleRun, Thread, Connection):
     
     def disconnect(self, initiator: bool):
         disconn_server_fp = self.session_info.disconn_server_fp
+        disconn_confirm_to_server_fp = self.session_info.disconn_confirm_to_server_fp
         disconn_client_fp = self.session_info.disconn_client_fp
-        create_symbol(disconn_client_fp)
-        if not initiator or wait_symbol(disconn_server_fp):
-            print(f'Successfully disconnect session: {self.session_info.session_id}.')
+        disconn_confirm_to_client_fp = self.session_info.disconn_confirm_to_client_fp
+        
+        if initiator:
+            self.safely_terminate_cmd(cause='disconnect')
+            create_symbol(disconn_client_fp)
+            if (
+                not wait_symbol(disconn_confirm_to_server_fp) or 
+                not wait_symbol(disconn_server_fp)
+            ):
+                print(
+                    'Warning: disconnection from client is not responded, '
+                    'ignore and continue...'
+                )
+            create_symbol(disconn_confirm_to_client_fp)
         else:
-            print('Session disconnection timeout. Force close.')
+            create_symbol(disconn_confirm_to_client_fp)
+            self.safely_terminate_cmd(cause='remote')
+            create_symbol(disconn_client_fp)
+            if not wait_symbol(disconn_confirm_to_server_fp):
+                print(
+                    'Warning: disconnection from client is not responded, '
+                    'ignore and continue...'
+                )
+        print(
+            f'Successfully disconnect session: {self.session_info.session_id}'
+        )
     
     def check_connection(self) -> bool:
         disconn_server_fp = self.session_info.disconn_server_fp
@@ -349,14 +387,12 @@ class Session(LifecycleRun, Thread, Connection):
         with self.running_cmd_lock:
             if check_symbol(disconn_server_fp):
                 self.disconnect(initiator=False)
-                self.safely_terminate_cmd(cause='remote')
                 return False
             elif (
                 session_state.destroy_local.is_set() or 
                 not self.heartbeat.beat()
             ):
                 self.disconnect(initiator=True)
-                self.safely_terminate_cmd(cause='local')
                 return False
         return True
 
@@ -396,11 +432,12 @@ class Command(LifecycleRun, Thread):
     def after_running(self):
         cmd_state = self.cmd_state
         session_info = self.session_info
-        if cmd_state.finished.is_set():
-            send_message_to_client(
-                session_info,
-                type='cmd_finished',
-                content=self.cmd_id
+        # Priority: Remote > Local > Finished
+        # Because if terminate remote is set, the client is waiting a 
+        # terminate confirm, so its priority should be the first.
+        if cmd_state.terminate_remote.is_set():
+            create_symbol(
+                self.session_info.command_terminate_confirm_fp(self.msg)
             )
         elif cmd_state.terminate_local.is_set():
             send_message_to_client(
@@ -408,10 +445,16 @@ class Command(LifecycleRun, Thread):
                 type='cmd_terminated',
                 content=self.cmd_id
             )
-        elif cmd_state.terminate_remote.is_set():
-            create_symbol(
-                self.session_info.command_terminate_confirm_fp(self.msg)
+        elif cmd_state.finished.is_set():
+            send_message_to_client(
+                session_info,
+                type='cmd_finished',
+                content=self.cmd_id
             )
+        elif cmd_state.terminate_disconnect.is_set():
+            # Doing nothing because the disconnect operations 
+            # will automatically notify the client.
+            pass
     
     #
     # Client info.
@@ -460,7 +503,8 @@ class ShellCommand(Command):
             while self.process.poll() is None:
                 if (
                     state.terminate_local.is_set() or 
-                    state.terminate_remote.is_set()
+                    state.terminate_remote.is_set() or 
+                    state.terminate_disconnect.is_set()
                 ):
                     self.process.kill()
                     return

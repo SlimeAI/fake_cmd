@@ -66,7 +66,9 @@ class SessionInfo(ServerInfo, ReadonlyAttr):
         self.conn_client_fp = self.concat_session_fp('client.conn')
         # Disconnect.
         self.disconn_server_fp = self.concat_session_fp('server.disconn')
+        self.disconn_confirm_to_server_fp = self.concat_session_fp('server.disconn.confirm')
         self.disconn_client_fp = self.concat_session_fp('client.disconn')
+        self.disconn_confirm_to_client_fp = self.concat_session_fp('client.disconn.confirm')
         # Heartbeat.
         self.heartbeat_server_fp = self.concat_session_fp('server.heartbeat')
         self.heartbeat_client_fp = self.concat_session_fp('client.heartbeat')

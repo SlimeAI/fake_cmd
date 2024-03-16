@@ -230,10 +230,19 @@ def check_symbol(fp: str, remove_lockfile: bool = True) -> bool:
 class Connection(ABC):
 
     @abstractmethod
-    def connect(self) -> bool: pass
+    def connect(self) -> bool:
+        """
+        Three-way handshake to connect.
+        """
+        pass
 
     @abstractmethod
-    def disconnect(self, initiator: bool): pass
+    def disconnect(self, initiator: bool):
+        """
+        Four-way handshake to disconnect. ``initiator``: whether 
+        the disconnection is initiated locally.
+        """
+        pass
     
     @abstractmethod
     def check_connection(self) -> bool:

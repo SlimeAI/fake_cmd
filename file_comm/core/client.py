@@ -1,7 +1,7 @@
 import sys
 import uuid
 import traceback
-from threading import Thread, Event
+from threading import Thread, Event, RLock
 from slime_core.utils.registry import Registry
 from slime_core.utils.typing import (
     MISSING,
@@ -48,6 +48,7 @@ class State:
         self.cmd_finished = Event()
         # CLI terminate indicator.
         self.terminate = Event()
+        self.terminate_lock = RLock()
     
     def reset(self) -> None:
         self.cmd_running.clear()
@@ -138,6 +139,10 @@ class Client(LifecycleRun, Connection):
     def after_running(self):
         remove_file(self.session_info.client_fp, remove_lockfile=True)
     
+    #
+    # Actions.
+    #
+    
     @client_registry(key='info')
     def process_info(self, msg: Message):
         print(msg.content)
@@ -149,6 +154,10 @@ class Client(LifecycleRun, Connection):
     @client_registry(key='cmd_terminated')
     def process_cmd_terminated(self, msg: Message):
         self.state.cmd_terminate_remote.set()
+    
+    #
+    # Connection operations.
+    #
     
     def connect(self) -> bool:
         address = self.session_info.address
@@ -176,29 +185,59 @@ class Client(LifecycleRun, Connection):
         return True
     
     def disconnect(self, initiator: bool):
+        print(
+            f'Disconnecting from server. Server: {self.session_info.address}. '
+            f'Session: {self.session_info.session_id}.'
+        )
+        
         disconn_server_fp = self.session_info.disconn_server_fp
+        disconn_confirm_to_server_fp = self.session_info.disconn_confirm_to_server_fp
         disconn_client_fp = self.session_info.disconn_client_fp
-        create_symbol(disconn_server_fp)
-        if not initiator or wait_symbol(disconn_client_fp):
-            print(f'Successfully disconnect session: {self.session_info.session_id}.')
+        disconn_confirm_to_client_fp = self.session_info.disconn_confirm_to_client_fp
+        state = self.state
+        if initiator:
+            with state.terminate_lock:
+                # Use lock to make it consistent.
+                # Send remaining messages before disconnect.
+                state.cmd_terminate_local.set()
+                # Send to server to disconnect.
+                create_symbol(disconn_server_fp)
+                if (
+                    not wait_symbol(disconn_confirm_to_client_fp) or 
+                    not wait_symbol(disconn_client_fp)
+                ):
+                    print(
+                        'Warning: disconnection from server is not responded, '
+                        'ignore and continue...'
+                    )
+                create_symbol(disconn_confirm_to_server_fp)
+                state.terminate.set()
         else:
-            print('Session disconnection timeout. Force close.')
+            with state.terminate_lock:
+                # Use lock to make it consistent.
+                create_symbol(disconn_confirm_to_server_fp)
+                # Send remaining messages.
+                state.cmd_terminate_remote.set()
+                create_symbol(disconn_server_fp)
+                if not wait_symbol(disconn_confirm_to_client_fp):
+                    print(
+                        'Warning: disconnection from server is not responded, '
+                        'ignore and continue...'
+                    )
+                state.terminate.set()
+        print('Disconnected.')
     
     def check_connection(self) -> bool:
         disconn_client_fp = self.session_info.disconn_client_fp
         # Disconnection from remote.
         if check_symbol(disconn_client_fp):
             self.disconnect(initiator=False)
-            self.state.cmd_terminate_remote.set()
-            self.state.terminate.set()
             return False
         elif (
             not self.heartbeat.beat() or 
             not self.cli.is_alive()
         ):
             self.disconnect(initiator=True)
-            self.state.cmd_terminate_local.set()
-            self.state.terminate.set()
             return False
         return True
 
@@ -228,6 +267,13 @@ class CLI(LifecycleRun, Thread):
         state = self.state
         while True:
             try:
+                # Use double check to make it safe.
+                if state.terminate.is_set():
+                    return
+                with state.terminate_lock:
+                    if state.terminate.is_set():
+                        return
+                
                 cmd = input('[fake_cmd] ')
                 msg = self.process_cmd(cmd)
                 if msg:
@@ -241,12 +287,13 @@ class CLI(LifecycleRun, Thread):
                 pass
             except:
                 traceback.print_exc()
-            
-            if state.terminate.is_set():
-                return
     
     def after_running(self):
         return
+    
+    #
+    # Command operations.
+    #
     
     def process_cmd(self, cmd: str) -> Union[Message, bool]:
         """

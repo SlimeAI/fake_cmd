@@ -9,4 +9,6 @@ that can be used to directly access the file.
 for the main server namespace.
 - ``terminate``: Denote to command-level terminate.
 - ``destroy``: Denote to session-level destroy.
+- About server and client naming: ``server`` means message sent to 
+server, so does ``client``.
 """
