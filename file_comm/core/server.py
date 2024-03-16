@@ -6,7 +6,9 @@ from slime_core.utils.typing import (
     Dict,
     Union,
     NOTHING,
-    Iterable
+    Iterable,
+    Missing,
+    Literal
 )
 from file_comm.utils.comm import (
     Connection,
@@ -48,8 +50,13 @@ class CommandState:
         self.terminate_remote = Event()
         # Finished.
         self.finished = Event()
-        # Command is queued.
+        # Command is queued. Used only to decide whether to 
+        # notify the client that the task is queued.
         self.queued = Event()
+        # The command is scheduled. Compared to ``queued``, it 
+        # is more safe because of using a ``RLock``.
+        self.scheduled = Event()
+        self.scheduled_lock = RLock()
     
     @property
     def pending_terminate(self) -> bool:
@@ -217,11 +224,8 @@ class Session(LifecycleRun, Thread, Connection):
                 action(self, msg)
     
     def after_running(self):
-        with self.running_cmd_lock:
-            running_cmd = self.running_cmd
-            if running_cmd:
-                # Cancel queued command.
-                self.cmd_pool.cancel(running_cmd)
+        # Further confirm the command is terminated.
+        self.safely_terminate_cmd(cause='destroy')
     
     #
     # Actions.
@@ -259,8 +263,7 @@ class Session(LifecycleRun, Thread, Connection):
                 return
             
             if running_cmd.cmd_id == cmd_id:
-                running_cmd.cmd_state.terminate_remote.set()
-                # TODO: how to handle queued command ?
+                self.safely_terminate_cmd(cause='remote')
             else:
                 send_message_to_client(
                     self.session_info,
@@ -271,6 +274,44 @@ class Session(LifecycleRun, Thread, Connection):
                         f'{running_cmd.cmd_id}'
                     )
                 )
+    
+    def safely_terminate_cmd(
+        self,
+        cmd: Union["Command", Missing] = MISSING,
+        cause: Literal['remote', 'local', 'destroy'] = 'remote'
+    ):
+        """
+        Safely terminate the cmd whether it is running, queued or finished. 
+        ``destroy``: called before the session destroyed to further make sure 
+        the command is terminated.
+        """
+        with self.running_cmd_lock:
+            if cmd is MISSING:
+                cmd = self.running_cmd
+            
+            if self.running_cmd is not cmd:
+                print(
+                    f'Warning: Running cmd inconsistency occurred.'
+                )
+            if not cmd:
+                return
+            
+            with cmd.cmd_state.scheduled_lock:
+                if cause == 'remote':
+                    cmd.cmd_state.terminate_remote.set()
+                elif cause == 'local':
+                    cmd.cmd_state.terminate_local.set()
+
+                # If currently ``scheduled`` is not set, then it will never 
+                # be scheduled by the pool (because terminate state is set 
+                # under the ``scheduled_lock``).
+                scheduled = cmd.cmd_state.scheduled.is_set()
+            
+            if not scheduled:
+                # Manually call the exit callbacks and ``after_running``, 
+                # because it will never be scheduled.
+                cmd.run_exit_callbacks__()
+                cmd.after_running()
     
     def set_running_cmd(self, running_cmd: Union["Command", None]):
         with self.running_cmd_lock:
@@ -306,19 +347,16 @@ class Session(LifecycleRun, Thread, Connection):
         session_state = self.session_state
         
         with self.running_cmd_lock:
-            running_cmd = self.running_cmd
             if check_symbol(disconn_server_fp):
                 self.disconnect(initiator=False)
-                if running_cmd:
-                    running_cmd.cmd_state.terminate_remote.set()
+                self.safely_terminate_cmd(cause='remote')
                 return False
             elif (
                 session_state.destroy_local.is_set() or 
                 not self.heartbeat.beat()
             ):
                 self.disconnect(initiator=True)
-                if running_cmd:
-                    running_cmd.cmd_state.terminate_local.set()
+                self.safely_terminate_cmd(cause='local')
                 return False
         return True
 

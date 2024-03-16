@@ -12,7 +12,7 @@ from slime_core.utils.typing import (
     Callable,
     Iterable
 )
-from . import polling
+from . import polling, config
 if TYPE_CHECKING:
     from file_comm.core.server import Command
 
@@ -68,7 +68,7 @@ class CommandPool:
         self.polling_thread.start()
     
     def run(self):
-        for _ in polling(1.0):
+        for _ in polling(config.cmd_pool_schedule_interval):
             if self.pool_close.is_set():
                 break
             
@@ -90,22 +90,32 @@ class CommandPool:
                 len(self.execute) < self.max_threads
             ):
                 cmd = self.queue.pop(0)
-                if cmd.cmd_state.pending_terminate:
+                cmd_state = cmd.cmd_state
+                if cmd_state.pending_terminate:
                     continue
                 
-                def terminate_func():
-                    with self.execute_lock:
-                        try:
-                            self.execute.remove(watch)
-                        except ValueError:
-                            pass
+                with cmd_state.scheduled_lock:
+                    if cmd_state.pending_terminate:
+                        # Double-check to make it safe.
+                        continue
                 
-                watch = CommandWatchdog(
-                    cmd,
-                    exit_callbacks=[terminate_func]
-                )
-                self.execute.append(watch)
-                watch.start()
+                    def terminate_func():
+                        with self.execute_lock:
+                            try:
+                                self.execute.remove(watch)
+                            except ValueError:
+                                pass
+                    
+                    watch = CommandWatchdog(
+                        cmd,
+                        exit_callbacks=[terminate_func]
+                    )
+                    self.execute.append(watch)
+                    watch.start()
+                    # Using a scheduled lock, it can ensure that when 
+                    # other threads check the ``scheduled`` Event, it 
+                    # is consistent with the real command running state.
+                    cmd_state.scheduled.set()
     
     def close(self):
         self.pool_close.set()
