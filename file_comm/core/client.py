@@ -106,10 +106,7 @@ class Client(LifecycleRun, Connection):
             self.session_info.heartbeat_server_fp
         )
         self.state = State()
-        self.cli = CLI(
-            self.session_info,
-            self.state
-        )
+        self.cli = CLI(self)
     
     #
     # Running operations.
@@ -281,17 +278,23 @@ class CLI(LifecycleRun, Thread):
     
     def __init__(
         self,
-        session_info: SessionInfo,
-        state: State
+        client: Client
     ):
         LifecycleRun.__init__(self)
         Thread.__init__(self)
-        self.session_info = session_info
-        self.state = state
+        self.client = client
         self.current_cmd: Union[CommandMessage, None] = None
         # Use a current cmd lock to make it consistent with 
         # the current waiting server cmd.
         self.current_cmd_lock = RLock()
+    
+    @property
+    def session_info(self) -> SessionInfo:
+        return self.client.session_info
+    
+    @property
+    def state(self) -> State:
+        return self.client.state
     
     #
     # Running operations.

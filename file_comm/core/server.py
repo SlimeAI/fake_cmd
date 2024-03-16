@@ -160,8 +160,8 @@ class Server(LifecycleRun):
             self.pop_session_dict(session_id)
         
         session = Session(
+            self,
             SessionInfo(self.server_info.address, session_id),
-            self.cmd_pool,
             exit_callbacks=[destroy_session_func]
         )
         if session_id in self.session_dict:
@@ -199,14 +199,14 @@ class Session(LifecycleRun, Thread, Connection):
     
     def __init__(
         self,
+        server: Server,
         session_info: SessionInfo,
-        cmd_pool: CommandPool,
         exit_callbacks: Union[Iterable[ExitCallbackFunc], None] = None
     ) -> None:
         LifecycleRun.__init__(self, exit_callbacks)
         Thread.__init__(self)
+        self.server = server
         self.session_info = session_info
-        self.cmd_pool = cmd_pool
         self.session_state = SessionState()
         self.heartbeat = Heartbeat(
             self.session_info.heartbeat_server_fp,
@@ -218,6 +218,10 @@ class Session(LifecycleRun, Thread, Connection):
         # file initialization
         self.session_info.init_session()
         print(f'Session {self.session_info.session_id} created.')
+    
+    @property
+    def cmd_pool(self) -> CommandPool:
+        return self.server.cmd_pool
     
     #
     # Running operations.
@@ -264,8 +268,8 @@ class Session(LifecycleRun, Thread, Connection):
             self.reset_running_cmd()
         
         cmd = ShellCommand(
+            self,
             msg,
-            self.session_info,
             exit_callbacks=[terminate_command_func]
         )
         self.set_running_cmd(cmd)
@@ -274,8 +278,8 @@ class Session(LifecycleRun, Thread, Connection):
     @action_registry(key='inner_cmd')
     def run_inner_cmd(self, msg: Message):
         cmd = InnerCommand(
+            self,
             msg,
-            self.session_info,
             exit_callbacks=[self.reset_running_cmd]
         )
         self.set_running_cmd(cmd)
@@ -370,9 +374,11 @@ class Session(LifecycleRun, Thread, Connection):
         """
         with self.running_cmd_lock:
             if (
-                not running_cmd and 
-                self.running_cmd
+                self.running_cmd and 
+                running_cmd
             ):
+                # One command is running or has not been terminated, but 
+                # another command received.
                 send_message_to_client(
                     self.session_info,
                     type='info',
@@ -465,16 +471,20 @@ class Command(LifecycleRun, Thread):
     
     def __init__(
         self,
+        session: Session,
         msg: Message,
-        session_info: SessionInfo,
         exit_callbacks: Union[Iterable[ExitCallbackFunc], None] = None
     ):
         LifecycleRun.__init__(self, exit_callbacks)
         Thread.__init__(self)
+        self.session = session
         self.msg = CommandMessage.clone(msg)
-        self.session_info = session_info
         self.process = NOTHING
         self.cmd_state = CommandState()
+    
+    @property
+    def session_info(self) -> SessionInfo:
+        return self.session.session_info
     
     @property
     def cmd_id(self) -> str:
