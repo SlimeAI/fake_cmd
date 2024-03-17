@@ -138,12 +138,12 @@ class Server(
     def __init__(
         self,
         address: str,
-        max_commands: Union[int, None] = None
+        max_cmds: Union[int, None] = None
     ) -> None:
         LifecycleRun.__init__(self)
         self.server_info = ServerInfo(address)
         self.session_dict: Dict[str, Session] = {}
-        self.cmd_pool = CommandPool(max_commands)
+        self.cmd_pool = CommandPool(max_cmds)
     
     #
     # Running operations.
