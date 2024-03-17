@@ -56,10 +56,18 @@ from . import ServerInfo, SessionInfo, dispatch_action, ActionFunc
 
 class SessionState(ReadonlyAttr):
     
-    readonly_attr__ = ('destroy_local',)
+    readonly_attr__ = (
+        'destroy_local',
+        'unable_to_communicate'
+    )
     
     def __init__(self) -> None:
         self.destroy_local = Event()
+        # Unable to communicate to client, so in 
+        # ``clear_cache``, it will clear the namespace 
+        # ignoring whether the client has already 
+        # finished reading messages.
+        self.unable_to_communicate = Event()
 
 
 class CommandState(ReadonlyAttr):
@@ -155,7 +163,7 @@ class Server(
             'may be another server is running at the same address. Check the '
             'address setting and if you are sure no other servers are running '
             'at the address, you may need to manually remove the file: '
-            f'{self.server_info.main_fp}.'
+            f'"{self.server_info.main_fp}".'
         )
         
         main_fp = self.server_info.main_fp
@@ -516,6 +524,8 @@ class Session(
                     'Disconnection from client is not responded, '
                     'ignore and continue...'
                 )
+                # Set the client is unable to communicate.
+                self.session_state.unable_to_communicate.set()
             create_symbol(disconn_confirm_to_client_fp)
         else:
             create_symbol(disconn_confirm_to_client_fp)
@@ -526,6 +536,8 @@ class Session(
                     'Disconnection from client is not responded, '
                     'ignore and continue...'
                 )
+                # Set the client is unable to communicate.
+                self.session_state.unable_to_communicate.set()
         logger.info(
             f'Successfully disconnect session: {self.session_info.session_id}'
         )
@@ -557,9 +569,13 @@ class Session(
         with file_lock(self.session_info.clear_lock_fp):
             remove_file(self.session_info.server_fp, remove_lockfile=True)
             client_destroyed = (not os.path.exists(self.session_info.client_fp))
-        if client_destroyed:
+        if (
+            client_destroyed or 
+            self.session_state.unable_to_communicate.is_set()
+        ):
             # The final clear operation should be done 
-            # here if the client is already destroyed.
+            # here if the client is already destroyed or 
+            # unable to communicate.
             self.session_info.clear_session()
     
     def to_str(self) -> str:

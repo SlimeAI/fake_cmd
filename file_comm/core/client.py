@@ -61,7 +61,8 @@ class State(ReadonlyAttr):
         'cmd_terminate_remote',
         'cmd_finished',
         'terminate',
-        'terminate_lock'
+        'terminate_lock',
+        'unable_to_communicate'
     )
     
     def __init__(self) -> None:
@@ -76,6 +77,11 @@ class State(ReadonlyAttr):
         # CLI terminate indicator.
         self.terminate = Event()
         self.terminate_lock = RLock()
+        # Unable to communicate to server, so in 
+        # ``clear_cache``, it will clear the namespace 
+        # ignoring whether the server has already 
+        # finished reading messages.
+        self.unable_to_communicate = Event()
     
     def reset(self) -> None:
         self.cmd_running.clear()
@@ -285,6 +291,8 @@ class Client(
                         'Disconnection from server is not responded, '
                         'ignore and continue...'
                     )
+                    # Set that the server is unable to communicate.
+                    state.unable_to_communicate.set()
                 create_symbol(disconn_confirm_to_server_fp)
                 state.terminate.set()
         else:
@@ -299,6 +307,8 @@ class Client(
                         'Disconnection from server is not responded, '
                         'ignore and continue...'
                     )
+                    # Set that the server is unable to communicate.
+                    state.unable_to_communicate.set()
                 state.terminate.set()
         logger.info('Disconnected.')
     
@@ -327,9 +337,13 @@ class Client(
         with file_lock(self.session_info.clear_lock_fp):
             remove_file(self.session_info.client_fp, remove_lockfile=True)
             session_destroyed = (not os.path.exists(self.session_info.server_fp))
-        if session_destroyed:
+        if (
+            session_destroyed or 
+            self.state.unable_to_communicate.is_set()
+        ):
             # The final clear operation should be done 
-            # here if the session is already destroyed.
+            # here if the session is already destroyed 
+            # or the server is unable to communicate.
             self.session_info.clear_session()
 
 
