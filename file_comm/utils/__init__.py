@@ -8,12 +8,16 @@ from slime_core.utils.typing import (
 class Config:
     
     def __init__(self) -> None:
-        self.polling_interval = 0.1
+        self.polling_interval = 0.5
         self.cmd_pool_schedule_interval = 0.5
         # Server-Client response timeout.
         self.wait_timeout = 30.0
-        # Command terminate wait timeout.
-        self.cmd_terminate_timeout = 10.0
+        # Command terminate wait timeout (used by 
+        # client to decide how long to wait when 
+        # kill a command).
+        self.cmd_terminate_timeout = 20.0
+        self.cmd_force_kill_timeout = 5.0
+        # Heartbeat settings.
         self.heart_beat_interval = 3.0
         self.heart_beat_timeout = 10.0
 

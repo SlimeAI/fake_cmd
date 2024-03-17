@@ -1,7 +1,7 @@
 import os
 import time
 import subprocess
-from subprocess import Popen
+from subprocess import Popen, TimeoutExpired
 from threading import Thread, Event, RLock
 from abc import ABCMeta
 from slime_core.utils.metabase import ReadonlyAttr
@@ -51,6 +51,7 @@ from file_comm.utils import (
     config,
     timestamp_to_str
 )
+from file_comm.utils.exception import ServerShutdown
 from file_comm.utils.logging import logger
 from file_comm.utils.system import send_keyboard_interrupt
 from . import ServerInfo, SessionInfo, dispatch_action, ActionFunc
@@ -201,9 +202,16 @@ class Server(
         for msg in listen_messages(
             self.server_info.main_fp
         ):
-            action = dispatch_action(self.action_registry, msg.type, 'Main Server')
-            if action is not MISSING:
-                action(self, msg)
+            try:
+                action = dispatch_action(
+                    self.action_registry,
+                    msg.type,
+                    'Main Server'
+                )
+                if action is not MISSING:
+                    action(self, msg)
+            except ServerShutdown:
+                return
     
     def after_running(self, *args):
         logger.info('Server shutting down...')
@@ -259,6 +267,13 @@ class Server(
         session = self.session_dict[session_id]
         state = session.session_state
         state.destroy_local.set()
+    
+    @action_registry(key='server_shutdown')
+    def server_shutdown(self, msg: Message):
+        logger.info(
+            f'Server shutdown received from: "{msg.session_id}".'
+        )
+        raise ServerShutdown
     
     def pop_session_dict(self, session_id: str):
         return self.session_dict.pop(session_id, None)
@@ -768,20 +783,29 @@ class ShellCommand(Command):
             # Set process.
             self.process = process
             while process.poll() is None:
-                if (
-                    state.force_kill.is_set() or 
+                # NOTE: DO NOT return after the signal is sent, 
+                # and it should always wait until the process 
+                # killed.
+                if state.force_kill.is_set():
+                    # Directly kill the process.
+                    process.kill()
+                elif (
                     state.terminate_local.is_set() or 
                     state.terminate_disconnect.is_set()
                 ):
-                    # Directly kill the process.
-                    process.kill()
-                    # NOTE: DO NOT return here, it should always 
-                    # wait until the process killed.
+                    # Terminate the process.
+                    process.terminate()
                 elif state.terminate_remote.is_set():
+                    # Reserve a few seconds for ``process.terminate``.
+                    timeout_for_process_terminate = 5.0
                     # Terminate with keyboard interrupt.
                     send_keyboard_interrupt(process)
-                    # NOTE: DO NOT return here, it should always 
-                    # wait until the process killed.
+                    try:
+                        process.wait(
+                            config.cmd_terminate_timeout - timeout_for_process_terminate
+                        )
+                    except TimeoutExpired:
+                        process.terminate()
         
         if not state.pending_terminate:
             # Normally finished.

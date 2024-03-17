@@ -14,7 +14,8 @@ from slime_core.utils.typing import (
     MISSING,
     Union,
     Callable,
-    Any
+    Any,
+    Literal
 )
 from file_comm.utils.comm import (
     Connection,
@@ -49,6 +50,7 @@ Inner command help:
 ``ls-session``: List all the alive sessions.
 ``ls-cmd``: List all the commands executing or queued.
 ``ls-back``: List the background command of the current session.
+``server_shutdown``: Shutdown the whole server. BE CAREFUL TO USE IT!!!
 """
 
 
@@ -171,6 +173,18 @@ class Client(
     #
     
     def before_running(self) -> bool:
+        main_fp = self.session_info.main_fp
+        address = self.session_info.address
+        
+        # Should check whether the server exists. Otherwise, 
+        # ``self.connect`` will create a new ``main_fp`` file 
+        # and the real server startup will fail after that.
+        if not os.path.exists(main_fp):
+            logger.warning(
+                f'Server address not found: {address}.'
+            )
+            return False
+        
         return self.connect()
     
     def running(self):
@@ -411,16 +425,26 @@ class CLI(
     
     def running(self):
         state = self.state
+        
+        def safe_check_terminate() -> bool:
+            """
+            Safely check whether to terminate.
+            """
+            # Use double check to make it safe.
+            if state.terminate.is_set():
+                return True
+            with state.terminate_lock:
+                if state.terminate.is_set():
+                    return True
+            return False
+        
         while True:
             try:
-                # Use double check to make it safe.
-                if state.terminate.is_set():
-                    return
-                with state.terminate_lock:
-                    if state.terminate.is_set():
-                        return
-                
+                # The terminate state should be checked before and after the 
+                # cmd input.
+                if safe_check_terminate(): return
                 cmd = input(self.input_hint)
+                if safe_check_terminate(): return
                 # NOTE: the state reset should be in front of the command sent 
                 # to the server.
                 state.reset()
@@ -533,7 +557,7 @@ class CLI(
                         type='force_kill_cmd',
                         content=msg.cmd_id
                     )
-                    remote_terminated = wait_symbol(confirm_fp, config.cmd_terminate_timeout)
+                    remote_terminated = wait_symbol(confirm_fp, config.cmd_force_kill_timeout)
                 
                 if remote_terminated:
                     logger.info(
@@ -560,15 +584,16 @@ class CLI(
         raise CLITerminate
     
     @cli_registry(key='sid')
-    def cli_sid(self, cmd: str) -> bool:
+    def cli_sid(self, cmd: str) -> Literal[False]:
         print(
             f'Session id: {self.session_info.session_id}'
         )
         return False
     
     @cli_registry(key='help')
-    def cli_help(self, cmd: str):
+    def cli_help(self, cmd: str) -> Literal[False]:
         print(CLIENT_HELP.strip('\n'))
+        return False
     
     @cli_registry.register_multi([
         'ls-back',
@@ -577,6 +602,30 @@ class CLI(
     ])
     def inner_cmd(self, cmd: str) -> Union[CommandMessage, bool]:
         return self.send_server_cmd(cmd, type='inner_cmd')
+    
+    @cli_registry(key='server_shutdown')
+    def server_shutdown(self, cmd: str) -> Literal[False]:
+        try:
+            confirm_key = 'YES'
+            res = input(
+                'WARNING: You are trying to shutdown the server. '
+                'This behavior will terminate all the running '
+                'commands and destroy all the sessions. Use ``ls-cmd``'
+                'and ``ls-session`` to check them. If you are '
+                f'sure, enter exactly "{confirm_key}", else enter '
+                f'anything else. ("{confirm_key}" / [Anything else]): '
+            )
+            if res != confirm_key:
+                logger.info(
+                    'Server shutdown canceled.'
+                )
+                return False
+            send_message_to_server(
+                self.session_info,
+                type='server_shutdown'
+            )
+        finally:
+            return False
     
     def redirect_output(self, fp: str) -> bool:
         """
