@@ -155,7 +155,16 @@ def pop_message(fp: str) -> Union[Message, bool]:
     message = pop_first_line(fp)
     if not message:
         return False
-    msg = Message.from_json(message)
+    try:
+        # If the json decode fails (mostly because of file 
+        # read and written at the same time, causing file 
+        # inconsistency), directly return ``False``.
+        # Because the message will be re-sent if no confirm 
+        # file is created, the consistency is ensured.
+        msg = Message.from_json(message)
+    except Exception as e:
+        logger.error(str(e))
+        return False
     # Create a confirmation symbol.
     create_symbol(msg.confirm_fp)
     return msg
