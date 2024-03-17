@@ -21,7 +21,8 @@ from slime_core.utils.typing import (
     Missing,
     Literal,
     Callable,
-    Any
+    Any,
+    Nothing
 )
 from file_comm.utils.comm import (
     Connection,
@@ -51,6 +52,7 @@ from file_comm.utils import (
     timestamp_to_str
 )
 from file_comm.utils.logging import logger
+from file_comm.utils.system import send_keyboard_interrupt
 from . import ServerInfo, SessionInfo, dispatch_action, ActionFunc
 
 
@@ -76,6 +78,7 @@ class CommandState(ReadonlyAttr):
         'terminate_local',
         'terminate_remote',
         'terminate_disconnect',
+        'force_kill',
         'finished',
         'exit',
         'queued',
@@ -90,6 +93,8 @@ class CommandState(ReadonlyAttr):
         self.terminate_remote = Event()
         # Terminate because of disconnection.
         self.terminate_disconnect = Event()
+        # Force kill.
+        self.force_kill = Event()
         # Mark that the command normally finished.
         self.finished = Event()
         # Mark that the command finally exit, whether through itself 
@@ -109,7 +114,8 @@ class CommandState(ReadonlyAttr):
         return (
             self.terminate_local.is_set() or 
             self.terminate_remote.is_set() or 
-            self.terminate_disconnect.is_set()
+            self.terminate_disconnect.is_set() or 
+            self.force_kill.is_set()
         )
 
 
@@ -386,15 +392,20 @@ class Session(
             if running_cmd.cmd_id == cmd_id:
                 self.safely_terminate_cmd(cause='remote')
             else:
-                send_message_to_client(
-                    self.session_info,
-                    type='info',
-                    content=(
-                        f'Command running inconsistency occurred. '
-                        f'Requiring from client: {cmd_id}. Actual running: '
-                        f'{running_cmd.cmd_id}'
-                    )
-                )
+                self.notify_cmd_inconsistency(running_cmd, cmd_id)
+    
+    @action_registry(key='force_kill_cmd')
+    def force_kill_cmd(self, msg: Message):
+        cmd_id = msg.content
+        with self.running_cmd_lock:
+            running_cmd = self.running_cmd
+            if not running_cmd:
+                return
+            
+            if running_cmd.cmd_id == cmd_id:
+                self.safely_terminate_cmd(cause='force')
+            else:
+                self.notify_cmd_inconsistency(running_cmd, cmd_id)
     
     @action_registry(key='background_cmd')
     def make_cmd_background(self, msg: Message):
@@ -405,18 +416,28 @@ class Session(
                 return
             
             if running_cmd.cmd_id != cmd_id:
-                send_message(
-                    self.session_info,
-                    type='info',
-                    content=(
-                        f'Command running inconsistency occurred. '
-                        f'Requiring background from client: {cmd_id}. Actual running: '
-                        f'{running_cmd.cmd_id}'
-                    )
-                )
+                self.notify_cmd_inconsistency(running_cmd, cmd_id)
                 return
             self.background_cmds.append(running_cmd)
             self.reset_running_cmd()
+    
+    def notify_cmd_inconsistency(
+        self,
+        running_cmd: "Command",
+        incoming_cmd_id: str
+    ):
+        """
+        Notify the command id inconsistency.
+        """
+        send_message(
+            self.session_info,
+            type='info',
+            content=(
+                f'Command running inconsistency occurred. '
+                f'Requiring from client: {incoming_cmd_id}. Actual running: '
+                f'{running_cmd.cmd_id}'
+            )
+        )
     
     #
     # Command operations.
@@ -425,7 +446,7 @@ class Session(
     def safely_terminate_cmd(
         self,
         cmd: Union["Command", Missing] = MISSING,
-        cause: Literal['remote', 'local', 'destroy', 'disconnect'] = 'remote'
+        cause: Literal['remote', 'local', 'destroy', 'disconnect', 'force'] = 'remote'
     ):
         """
         Safely terminate the cmd whether it is running, queued or finished. 
@@ -443,18 +464,21 @@ class Session(
             if not cmd:
                 return
             
-            with cmd.cmd_state.scheduled_lock:
-                if cause == 'remote':
-                    cmd.cmd_state.terminate_remote.set()
-                elif cause == 'local':
-                    cmd.cmd_state.terminate_local.set()
-                elif cause == 'disconnect':
-                    cmd.cmd_state.terminate_disconnect.set()
+            cmd_state = cmd.cmd_state
+            with cmd_state.scheduled_lock:
+                cause_dict = {
+                    'remote': cmd_state.terminate_remote,
+                    'local': cmd_state.terminate_local,
+                    'disconnect': cmd_state.terminate_disconnect,
+                    'force': cmd_state.force_kill
+                }
+                if cause in cause_dict:
+                    cause_dict[cause].set()
 
                 # If currently ``scheduled`` is not set, then it will never 
                 # be scheduled by the pool (because terminate state is set 
                 # under the ``scheduled_lock``).
-                scheduled = cmd.cmd_state.scheduled.is_set()
+                scheduled = cmd_state.scheduled.is_set()
             
             if not scheduled:
                 # Manually call the exit callbacks and ``after_running``, 
@@ -607,7 +631,8 @@ class Command(
         Thread.__init__(self)
         self.session = session
         self.msg = CommandMessage.clone(msg)
-        self.process = NOTHING
+        # The running process (if any).
+        self.process: Union[Popen, Nothing] = NOTHING
         self.cmd_state = CommandState()
     
     @property
@@ -637,7 +662,10 @@ class Command(
         # Priority: Remote > Local > Finished
         # Because if terminate remote is set, the client is waiting a 
         # terminate confirm, so its priority should be the first.
-        if cmd_state.terminate_remote.is_set():
+        if (
+            cmd_state.terminate_remote.is_set() or 
+            cmd_state.force_kill.is_set()
+        ):
             create_symbol(
                 self.session_info.command_terminate_confirm_fp(self.msg)
             )
@@ -715,7 +743,8 @@ class Command(
         return (
             f'Command(cmd="{self.msg.content}", cmd_id="{self.msg.cmd_id}", '
             f'session_id="{self.session_info.session_id}", '
-            f'created_time={timestamp_to_str(self.msg.timestamp)})'
+            f'created_time={timestamp_to_str(self.msg.timestamp)}, '
+            f'pid={str(self.process.pid)})'
         )
 
 
@@ -729,23 +758,30 @@ class ShellCommand(Command):
         with LockedTextIO(
             open(output_fp, 'a'), output_fp
         ) as output_f:
-            # NOTE: should change ``stdin`` to avoid termination 
-            # by KeyboardInterrupt in cmd.
-            self.process = Popen(
+            process = Popen(
                 msg.content,
                 shell=True,
                 stdin=subprocess.PIPE,
                 stdout=output_f,
                 stderr=output_f
             )
-            while self.process.poll() is None:
+            # Set process.
+            self.process = process
+            while process.poll() is None:
                 if (
+                    state.force_kill.is_set() or 
                     state.terminate_local.is_set() or 
-                    state.terminate_remote.is_set() or 
                     state.terminate_disconnect.is_set()
                 ):
-                    self.process.kill()
-                    return
+                    # Directly kill the process.
+                    process.kill()
+                    # NOTE: DO NOT return here, it should always 
+                    # wait until the process killed.
+                elif state.terminate_remote.is_set():
+                    # Terminate with keyboard interrupt.
+                    send_keyboard_interrupt(process)
+                    # NOTE: DO NOT return here, it should always 
+                    # wait until the process killed.
         
         if not state.pending_terminate:
             # Normally finished.
@@ -760,14 +796,14 @@ class InnerCommand(Command):
         msg = self.msg
         inner_cmd = msg.content
         output_fp = self.output_fp
-        output_f = LockedTextIO(open(output_fp, 'a'), output_fp)
         action = dispatch_action(
             self.inner_cmd_registry,
             inner_cmd,
             f'Session inner command: {inner_cmd}. Session id: {self.session_info.session_id}'
         )
         if action is not MISSING:
-            action(self, output_f)
+            with LockedTextIO(open(output_fp, 'a'), output_fp) as output_f:
+                action(self, output_f)
         
         state = self.cmd_state
         if not state.pending_terminate:
@@ -775,14 +811,14 @@ class InnerCommand(Command):
     
     @inner_cmd_registry(key='ls-back')
     def list_background(self, output_f: LockedTextIO):
-        background_cmds = self.session.background_cmds
+        background_cmds = tuple(self.session.background_cmds.update_and_get())
         if len(background_cmds) == 0:
             output_f.print__(
                 'No background cmds available.'
             )
             return
         output_f.print__('Background commands:')
-        for index, cmd in enumerate(tuple(background_cmds.update_and_get())):
+        for index, cmd in enumerate(background_cmds):
             output_f.print__(
                 f'{index}. {cmd.to_str()}'
             )

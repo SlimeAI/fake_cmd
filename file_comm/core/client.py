@@ -33,6 +33,7 @@ from file_comm.utils.parallel import (
     LifecycleRun
 )
 from file_comm.utils import (
+    config,
     polling,
     get_server_name
 )
@@ -59,6 +60,7 @@ class State(ReadonlyAttr):
         'cmd_running',
         'cmd_terminate_local',
         'cmd_terminate_remote',
+        'cmd_force_kill',
         'cmd_finished',
         'terminate',
         'terminate_lock',
@@ -72,6 +74,10 @@ class State(ReadonlyAttr):
         self.cmd_terminate_local = Event()
         # Command terminated from remote.
         self.cmd_terminate_remote = Event()
+        # Command force kill.
+        # NOTE: The force kill is always set after 
+        # ``cmd_terminate_local``.
+        self.cmd_force_kill = Event()
         # Command finished.
         self.cmd_finished = Event()
         # CLI terminate indicator.
@@ -87,6 +93,7 @@ class State(ReadonlyAttr):
         self.cmd_running.clear()
         self.cmd_terminate_local.clear()
         self.cmd_terminate_remote.clear()
+        self.cmd_force_kill.clear()
         self.cmd_finished.clear()
 
 
@@ -197,8 +204,12 @@ class Client(
                     if action is not MISSING:
                         action(self, msg)
             except KeyboardInterrupt:
-                logger.info('Keyboard Interrupt.')
+                print('Keyboard Interrupt.')
                 if state.cmd_running.is_set():
+                    if state.cmd_terminate_local.is_set():
+                        print('Force kill set.')
+                        # Double "Ctrl + C" to force kill the command.
+                        state.cmd_force_kill.set()
                     state.cmd_terminate_local.set()
             except:
                 traceback.print_exc()
@@ -281,6 +292,7 @@ class Client(
                 # Use lock to make it consistent.
                 # Send remaining messages before disconnect.
                 state.cmd_terminate_local.set()
+                state.cmd_force_kill.set()
                 # Send to server to disconnect.
                 create_symbol(disconn_server_fp)
                 if (
@@ -508,7 +520,22 @@ class CLI(
                     type='terminate_cmd',
                     content=msg.cmd_id
                 )
-                if wait_symbol(confirm_fp):
+                remote_terminated = wait_symbol(confirm_fp, config.cmd_terminate_timeout)
+                
+                if (
+                    not remote_terminated and 
+                    state.cmd_force_kill.is_set()
+                ):
+                    # After terminate local, check force kill.
+                    logger.info('Trying force kill the command...')
+                    send_message_to_session(
+                        self.session_info,
+                        type='force_kill_cmd',
+                        content=msg.cmd_id
+                    )
+                    remote_terminated = wait_symbol(confirm_fp, config.cmd_terminate_timeout)
+                
+                if remote_terminated:
                     logger.info(
                         f'Command successfully terminated.'
                     )

@@ -10,7 +10,9 @@ from slime_core.utils.typing import (
     Any,
     Missing,
     MISSING,
-    Union
+    Union,
+    is_slime_naming,
+    is_magic_naming
 )
 from . import polling, config
 
@@ -163,8 +165,7 @@ class LockedTextIO:
         self.attrs__ = {
             'write',
             'writelines',
-            'flush',
-            'print__'
+            'flush'
         }
     
     def print__(self, content: str):
@@ -192,13 +193,19 @@ class LockedTextIO:
             return self.f__.flush(*args, **kwds)
     
     def __enter__(self):
-        return self.f__.__enter__()
+        self.f__.__enter__()
+        # NOTE: should return ``self`` rather than 
+        # ``self.f__`` for outside usage.
+        return self
     
     def __exit__(self, *args, **kwds):
         return self.f__.__exit__(*args, **kwds)
     
     def __getattribute__(self, __name: str) -> Any:
-        if __name in {'f__', 'fp__', 'attrs__'}:
+        if (
+            is_slime_naming(__name) or 
+            is_magic_naming(__name)
+        ):
             return super().__getattribute__(__name)
         if __name in self.attrs__:
             return super().__getattribute__(__name)
