@@ -3,6 +3,13 @@ import time
 import subprocess
 from subprocess import Popen
 from threading import Thread, Event, RLock
+from abc import ABCMeta
+from slime_core.utils.metabase import ReadonlyAttr
+from slime_core.utils.metaclass import (
+    Metaclasses,
+    _ReadonlyAttrMetaclass,
+    InitOnceMetaclass
+)
 from slime_core.utils.base import BaseList
 from slime_core.utils.registry import Registry
 from slime_core.utils.typing import (
@@ -47,13 +54,26 @@ from file_comm.utils.logging import logger
 from . import ServerInfo, SessionInfo, dispatch_action, ActionFunc
 
 
-class SessionState:
+class SessionState(ReadonlyAttr):
+    
+    readonly_attr__ = ('destroy_local',)
     
     def __init__(self) -> None:
         self.destroy_local = Event()
 
 
-class CommandState:
+class CommandState(ReadonlyAttr):
+    
+    readonly_attr__ = (
+        'terminate_local',
+        'terminate_remote',
+        'terminate_disconnect',
+        'finished',
+        'exit',
+        'queued',
+        'scheduled',
+        'scheduled_lock'
+    )
     
     def __init__(self) -> None:
         # Terminate from local.
@@ -101,7 +121,16 @@ def send_message_to_client(
     return (msg, send_message(msg))
 
 
-class Server(LifecycleRun):
+class Server(
+    LifecycleRun,
+    ReadonlyAttr,
+    metaclass=Metaclasses(ABCMeta, _ReadonlyAttrMetaclass)
+):
+    readonly_attr__ = (
+        'server_info',
+        'session_dict',
+        'cmd_pool'
+    )
     
     # Dispatch different message types.
     action_registry = Registry[ActionFunc]('server_action')
@@ -221,10 +250,25 @@ class Server(LifecycleRun):
         return self.session_dict.pop(session_id, None)
 
 
-class Session(LifecycleRun, Thread, Connection):
+class Session(
+    LifecycleRun,
+    Thread,
+    Connection,
+    ReadonlyAttr,
+    metaclass=Metaclasses(ABCMeta, _ReadonlyAttrMetaclass)
+):
     """
     One session can only run one command at the same time.
     """
+    readonly_attr__ = (
+        'server',
+        'session_info',
+        'session_state',
+        'heartbeat',
+        'running_cmd_lock',
+        'background_cmds',
+        'created_timestamp'
+    )
     
     # Dispatch different message types.
     action_registry = Registry[ActionFunc]('session_action')
@@ -525,7 +569,17 @@ class Session(LifecycleRun, Thread, Connection):
         )
 
 
-class Command(LifecycleRun, Thread):
+class Command(
+    LifecycleRun,
+    Thread,
+    ReadonlyAttr,
+    metaclass=Metaclasses(ABCMeta, _ReadonlyAttrMetaclass)
+):
+    readonly_attr__ = (
+        'session',
+        'msg',
+        'cmd_state'
+    )
     
     def __init__(
         self,
@@ -750,10 +804,15 @@ class InnerCommand(Command):
                     )
 
 
-class BackgroundCommandList(BaseList[Command]):
+class BackgroundCommandList(
+    BaseList[Command],
+    ReadonlyAttr,
+    metaclass=Metaclasses(ABCMeta, _ReadonlyAttrMetaclass, InitOnceMetaclass)
+):
     """
     Used to contain the commands that failed to terminate in time.
     """
+    readonly_attr__ = ('lock',)
     
     def __init__(self):
         super().__init__()

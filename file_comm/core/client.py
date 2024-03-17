@@ -3,6 +3,12 @@ import sys
 import uuid
 import traceback
 from threading import Thread, Event, RLock
+from abc import ABCMeta
+from slime_core.utils.metabase import ReadonlyAttr
+from slime_core.utils.metaclass import (
+    Metaclasses,
+    _ReadonlyAttrMetaclass
+)
 from slime_core.utils.registry import Registry
 from slime_core.utils.typing import (
     MISSING,
@@ -45,10 +51,19 @@ Inner command help:
 """
 
 
-class State:
+class State(ReadonlyAttr):
     """
     Communication items between client and cli.
     """
+    readonly_attr__ = (
+        'cmd_running',
+        'cmd_terminate_local',
+        'cmd_terminate_remote',
+        'cmd_finished',
+        'terminate',
+        'terminate_lock'
+    )
+    
     def __init__(self) -> None:
         # Indicator that whether a command is running.
         self.cmd_running = Event()
@@ -101,7 +116,18 @@ def send_message_to_session(
     return (msg, send_message(msg))
 
 
-class Client(LifecycleRun, Connection):
+class Client(
+    LifecycleRun,
+    Connection,
+    ReadonlyAttr,
+    metaclass=Metaclasses(ABCMeta, _ReadonlyAttrMetaclass)
+):
+    readonly_attr__ = (
+        'session_info',
+        'heartbeat',
+        'state',
+        'cli'
+    )
     
     client_registry = Registry[ActionFunc]('client_registry')
     
@@ -307,7 +333,17 @@ class Client(LifecycleRun, Connection):
             self.session_info.clear_session()
 
 
-class CLI(LifecycleRun, Thread):
+class CLI(
+    LifecycleRun,
+    Thread,
+    ReadonlyAttr,
+    metaclass=Metaclasses(ABCMeta, _ReadonlyAttrMetaclass)
+):
+    readonly_attr__ = (
+        'client',
+        'current_cmd_lock',
+        'server_name'
+    )
     
     cli_registry = Registry[Callable[[Any, str], Union[CommandMessage, bool]]]('cli_registry')
     
