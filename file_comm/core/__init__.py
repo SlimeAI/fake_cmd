@@ -1,4 +1,5 @@
 import os
+import shutil
 from slime_core.utils.metabase import ReadonlyAttr
 from slime_core.utils.registry import Registry
 from slime_core.utils.typing import (
@@ -9,7 +10,8 @@ from slime_core.utils.typing import (
     Any
 )
 from file_comm.utils.comm import Message, CommandMessage
-from file_comm.utils.file import create_empty_file
+from file_comm.utils.file import create_empty_file, remove_file, file_lock
+from file_comm.utils.logging import logger
 
 
 class ServerInfo(ReadonlyAttr):
@@ -26,10 +28,17 @@ class ServerInfo(ReadonlyAttr):
     ) -> None:
         self.address = address
         self.main_fname = 'main.listen'
+        # Used as a file lock to check if another server is listening 
+        # the same address.
+        self.main_check = 'main.check'
 
     @property
     def main_fp(self) -> str:
         return self.concat_server_fp(self.main_fname)
+
+    @property
+    def main_check_fp(self) -> str:
+        return self.concat_server_fp(self.main_check)
 
     def init_server(self):
         """
@@ -37,6 +46,19 @@ class ServerInfo(ReadonlyAttr):
         """
         os.makedirs(self.address, exist_ok=True)
         create_empty_file(self.main_fp)
+    
+    def clear_server(self):
+        """
+        Clear server listening files.
+        """
+        with file_lock(self.main_check_fp):
+            remove_file(self.main_fp, remove_lockfile=True)
+        remove_file(self.main_check_fp, remove_lockfile=True)
+        try:
+            # If empty, then remove.
+            os.rmdir(self.address)
+        except (OSError, FileNotFoundError):
+            pass
     
     def concat_server_fp(self, fname: str) -> str:
         return os.path.join(self.address, fname)
@@ -72,14 +94,24 @@ class SessionInfo(ServerInfo, ReadonlyAttr):
         # Heartbeat.
         self.heartbeat_server_fp = self.concat_session_fp('server.heartbeat')
         self.heartbeat_client_fp = self.concat_session_fp('client.heartbeat')
+        # Clear lock.
+        # This lock is used to ensure the corresponding namespace will be 
+        # completely cleared after the session is destroyed, and the 
+        # destruction won't clear the reading files.
+        self.clear_lock_fp = self.concat_session_fp('clear.lock')
     
     @property
     def session_namespace(self) -> str:
         return os.path.join(self.address, self.session_id)
     
     def init_server(self):
-        print(
-            f'Warning: ``init_server`` should not be called in the ``SessionInfo``.'
+        logger.warning(
+            f'``init_server`` should not be called in the ``SessionInfo``.'
+        )
+    
+    def clear_server(self):
+        logger.warning(
+            f'``clear_server`` should not be called in the ``SessionInfo``.'
         )
     
     def init_session(self):
@@ -89,6 +121,15 @@ class SessionInfo(ServerInfo, ReadonlyAttr):
         os.makedirs(self.session_namespace, exist_ok=True)
         create_empty_file(self.server_fp)
         create_empty_file(self.client_fp)
+    
+    def clear_session(self):
+        """
+        Clear the session files.
+        """
+        try:
+            shutil.rmtree(self.session_namespace)
+        except FileNotFoundError:
+            pass
     
     def concat_session_fp(self, fname: str) -> str:
         return os.path.join(self.session_namespace, fname)
@@ -119,8 +160,8 @@ def dispatch_action(
     """
     action = registry.get(type, MISSING)
     if action is MISSING:
-        print(
-            f'Warning: unsupported message type received in {caller}: {type}, '
+        logger.warning(
+            f'Unsupported message type received in {caller}: {type}, '
             f'and it is ignored. Supported types: {tuple(registry.keys())}'
         )
     return action

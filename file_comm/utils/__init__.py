@@ -1,3 +1,4 @@
+import os
 import time
 from slime_core.utils.typing import (
     MISSING
@@ -30,3 +31,23 @@ def polling(
     while True:
         time.sleep(interval)
         yield
+
+
+def timestamp_to_str(timestamp: float) -> str:
+    """
+    Parse timestamp to str.
+    """
+    time_tuple = time.localtime(int(timestamp))
+    return time.strftime('%Y/%m/%d %H:%M:%S', time_tuple)
+
+
+def get_server_name(address: str) -> str:
+    dir_path = address
+    possible_server_name = ''
+    while dir_path and not possible_server_name:
+        dir_path, possible_server_name = os.path.split(dir_path)
+    
+    if possible_server_name:
+        return possible_server_name
+    else:
+        return 'remote'

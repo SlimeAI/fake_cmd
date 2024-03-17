@@ -17,6 +17,7 @@ from slime_core.utils.typing import (
     MISSING
 )
 from . import polling, config
+from .logging import logger
 from .file import (
     pop_first_line,
     append_line,
@@ -176,7 +177,7 @@ def send_message(
     while True:
         attempt += 1
         if attempt > 1:
-            print(
+            logger.warning(
                 f'Retrying sending the message: {msg_json}'
             )
         
@@ -185,7 +186,7 @@ def send_message(
             return True
         
         if attempt >= max_retries:
-            print(
+            logger.warning(
                 f'Message sent {attempt} times, but not responded. Expected confirm file: '
                 f'{confirm_fp}. Message content: {msg_json}.'
             )
@@ -291,7 +292,7 @@ class Heartbeat:
             self.last_receive is not None and 
             (now - self.last_receive) > self.timeout
         ):
-            print(
+            logger.warning(
                 f'Heartbeat time out at {self.receive_fp}.'
             )
             return False

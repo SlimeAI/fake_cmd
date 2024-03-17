@@ -1,3 +1,4 @@
+import os
 import sys
 import uuid
 import traceback
@@ -20,19 +21,27 @@ from file_comm.utils.comm import (
     Heartbeat,
     CommandMessage
 )
-from file_comm.utils.file import pop_all, remove_file
+from file_comm.utils.file import pop_all, remove_file, file_lock
 from file_comm.utils.exception import CLITerminate
 from file_comm.utils.parallel import (
     LifecycleRun
 )
 from file_comm.utils import (
-    polling
+    polling,
+    get_server_name
 )
+from file_comm.utils.logging import logger
 from . import SessionInfo, ActionFunc, dispatch_action
 
-CLIENT_NOTE = """
-NOTE: enter ``exit`` to shutdown the client.
+CLIENT_HELP = """
 NOTE: Use ``Ctrl+C`` AND ``Ctrl+D`` to start a new line.
+Inner command help:
+``help``: Get the help document.
+``exit``: Shutdown the client, disconnect session.
+``sid``: Get the sid of the client.
+``ls-session``: List all the alive sessions.
+``ls-cmd``: List all the commands executing or queued.
+``ls-back``: List the background command of the current session.
 """
 
 
@@ -96,10 +105,20 @@ class Client(LifecycleRun, Connection):
     
     client_registry = Registry[ActionFunc]('client_registry')
     
-    def __init__(self, address: str) -> None:
+    def __init__(
+        self,
+        address: str,
+        id_prefix: Union[str, None] = None
+    ) -> None:
+        """
+        ``id_prefix``: You can specify your own prefix to make the 
+        ``session_id`` more distinguishable.
+        """
         LifecycleRun.__init__(self)
         # Create a new session id.
         session_id = str(uuid.uuid1())
+        if id_prefix:
+            session_id = f'{id_prefix}-{session_id}'
         self.session_info = SessionInfo(address, session_id)
         self.heartbeat = Heartbeat(
             self.session_info.heartbeat_client_fp,
@@ -119,8 +138,8 @@ class Client(LifecycleRun, Connection):
         address = self.session_info.address
         session_id = self.session_info.session_id
         
-        print(f'Connect with server: {address}. Session id: {session_id}.')
-        print(CLIENT_NOTE.strip('\n'))
+        logger.info(f'Connect with server: {address}. Session id: {session_id}.')
+        print(CLIENT_HELP.strip('\n'))
         
         state = self.state
         to_be_destroyed = False
@@ -146,14 +165,14 @@ class Client(LifecycleRun, Connection):
                     if action is not MISSING:
                         action(self, msg)
             except KeyboardInterrupt:
-                print('Keyboard Interrupt.')
+                logger.info('Keyboard Interrupt.')
                 if state.cmd_running.is_set():
                     state.cmd_terminate_local.set()
             except:
                 traceback.print_exc()
     
     def after_running(self, *args):
-        remove_file(self.session_info.client_fp, remove_lockfile=True)
+        self.clear_cache()
     
     #
     # Actions.
@@ -161,7 +180,7 @@ class Client(LifecycleRun, Connection):
     
     @client_registry(key='info')
     def process_info(self, msg: Message):
-        print(msg.content)
+        logger.info(f'Info from server: {msg.content}')
     
     @client_registry(key='cmd_finished')
     def process_cmd_finished(self, msg: Message):
@@ -170,8 +189,8 @@ class Client(LifecycleRun, Connection):
             self.cli.current_cmd and 
             cmd_id != self.cli.current_cmd.cmd_id
         ):
-            print(
-                f'Warning: cmd inconsistency occurred.'
+            logger.warning(
+                f'Cmd inconsistency occurred.'
             )
         self.state.cmd_finished.set()
     
@@ -182,8 +201,8 @@ class Client(LifecycleRun, Connection):
             self.cli.current_cmd and 
             cmd_id != self.cli.current_cmd.cmd_id
         ):
-            print(
-                f'Warning: cmd inconsistency occurred.'
+            logger.warning(
+                f'Cmd inconsistency occurred.'
             )
         self.state.cmd_terminate_remote.set()
     
@@ -206,8 +225,8 @@ class Client(LifecycleRun, Connection):
             self.session_info.conn_client_fp,
             remove_lockfile=True
         ):
-            print(
-                f'Warning: server connection establishment failed. Server address: {address}.'
+            logger.warning(
+                f'Server connection establishment failed. Server address: {address}.'
                 f'Session id: {session_id}.'
             )
             return False
@@ -215,7 +234,7 @@ class Client(LifecycleRun, Connection):
         return True
     
     def disconnect(self, initiator: bool):
-        print(
+        logger.info(
             f'Disconnecting from server. Server: {self.session_info.address}. '
             f'Session: {self.session_info.session_id}.'
         )
@@ -236,8 +255,8 @@ class Client(LifecycleRun, Connection):
                     not wait_symbol(disconn_confirm_to_client_fp) or 
                     not wait_symbol(disconn_client_fp)
                 ):
-                    print(
-                        'Warning: disconnection from server is not responded, '
+                    logger.warning(
+                        'Disconnection from server is not responded, '
                         'ignore and continue...'
                     )
                 create_symbol(disconn_confirm_to_server_fp)
@@ -250,12 +269,12 @@ class Client(LifecycleRun, Connection):
                 state.cmd_terminate_remote.set()
                 create_symbol(disconn_server_fp)
                 if not wait_symbol(disconn_confirm_to_client_fp):
-                    print(
-                        'Warning: disconnection from server is not responded, '
+                    logger.warning(
+                        'Disconnection from server is not responded, '
                         'ignore and continue...'
                     )
                 state.terminate.set()
-        print('Disconnected.')
+        logger.info('Disconnected.')
     
     def check_connection(self) -> bool:
         disconn_client_fp = self.session_info.disconn_client_fp
@@ -270,6 +289,22 @@ class Client(LifecycleRun, Connection):
             self.disconnect(initiator=True)
             return False
         return True
+    
+    #
+    # Other methods
+    #
+    
+    def clear_cache(self):
+        """
+        Clear cached files.
+        """
+        with file_lock(self.session_info.clear_lock_fp):
+            remove_file(self.session_info.client_fp, remove_lockfile=True)
+            session_destroyed = (not os.path.exists(self.session_info.server_fp))
+        if session_destroyed:
+            # The final clear operation should be done 
+            # here if the session is already destroyed.
+            self.session_info.clear_session()
 
 
 class CLI(LifecycleRun, Thread):
@@ -287,6 +322,7 @@ class CLI(LifecycleRun, Thread):
         # Use a current cmd lock to make it consistent with 
         # the current waiting server cmd.
         self.current_cmd_lock = RLock()
+        self.server_name = get_server_name(self.session_info.address)
     
     @property
     def session_info(self) -> SessionInfo:
@@ -295,6 +331,10 @@ class CLI(LifecycleRun, Thread):
     @property
     def state(self) -> State:
         return self.client.state
+    
+    @property
+    def input_hint(self) -> str:
+        return f'[fake_cmd {self.server_name}] '
     
     def set_current_cmd(self, cmd: Union[CommandMessage, None]) -> None:
         with self.current_cmd_lock:
@@ -318,7 +358,7 @@ class CLI(LifecycleRun, Thread):
                     if state.terminate.is_set():
                         return
                 
-                cmd = input('[fake_cmd] ')
+                cmd = input(self.input_hint)
                 # NOTE: the state reset should be in front of the command sent 
                 # to the server.
                 state.reset()
@@ -386,6 +426,7 @@ class CLI(LifecycleRun, Thread):
         Wait the server command to finish.
         """
         output_fp = self.session_info.message_output_fp(msg)
+        confirm_fp = self.session_info.command_terminate_confirm_fp(msg)
         state = self.state
         
         to_be_terminated = False
@@ -409,7 +450,7 @@ class CLI(LifecycleRun, Thread):
                 state.cmd_terminate_local.is_set()
             ):
                 # Terminate from local.
-                print(
+                logger.info(
                     f'Terminating server command: {msg.cmd_content}.'
                 )
                 send_message_to_session(
@@ -417,15 +458,13 @@ class CLI(LifecycleRun, Thread):
                     type='terminate_cmd',
                     content=msg.cmd_id
                 )
-                if wait_symbol(
-                    self.session_info.command_terminate_confirm_fp(msg)
-                ):
-                    print(
+                if wait_symbol(confirm_fp):
+                    logger.info(
                         f'Command successfully terminated.'
                     )
                 else:
-                    print(
-                        f'Warning: command may take more time to terminate, and '
+                    logger.warning(
+                        f'Command may take more time to terminate, and '
                         f'it is now put to the background.'
                     )
                     send_message_to_session(
@@ -436,6 +475,7 @@ class CLI(LifecycleRun, Thread):
                 to_be_terminated = True
         
         # Remove all files.
+        remove_file(confirm_fp, remove_lockfile=True)
         remove_file(output_fp, remove_lockfile=True)
     
     @cli_registry(key='exit')
@@ -443,11 +483,15 @@ class CLI(LifecycleRun, Thread):
         raise CLITerminate
     
     @cli_registry(key='sid')
-    def cli_exit(self, cmd: str) -> bool:
+    def cli_sid(self, cmd: str) -> bool:
         print(
             f'Session id: {self.session_info.session_id}'
         )
         return False
+    
+    @cli_registry(key='help')
+    def cli_help(self, cmd: str):
+        print(CLIENT_HELP.strip('\n'))
     
     @cli_registry.register_multi([
         'ls-back',

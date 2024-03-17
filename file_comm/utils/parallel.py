@@ -79,7 +79,9 @@ class CommandPool:
         self.max_threads = max_threads or os.cpu_count() or 1
         self.pool_close = Event()
         self.polling_thread = Thread(target=self.run)
-        self.polling_thread.start()
+    
+    def start(self):
+        return self.polling_thread.start()
     
     def run(self):
         for _ in polling(config.cmd_pool_schedule_interval):
@@ -95,10 +97,9 @@ class CommandPool:
         """
         Schedule new jobs (in batch).
         """
-        with (
-            self.queue_lock,
-            self.execute_lock
-        ):
+        # NOTE: ``with (A, B): pass`` will raise exception in Python 3.7, 
+        # while ``with A, B: pass`` is ok.
+        with self.queue_lock, self.execute_lock:
             while (
                 self.queue and 
                 len(self.execute) < self.max_threads
@@ -139,10 +140,7 @@ class CommandPool:
         Submit a command and return whether the command will be executed 
         immediately.
         """
-        with (
-            self.queue_lock,
-            self.execute_lock
-        ):
+        with self.queue_lock, self.execute_lock:
             self.queue.append(cmd)
             queued = (len(self.queue) + len(self.execute)) > self.max_threads
             if queued:

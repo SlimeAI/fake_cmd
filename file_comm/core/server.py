@@ -1,3 +1,5 @@
+import os
+import time
 import subprocess
 from subprocess import Popen
 from threading import Thread, Event, RLock
@@ -27,7 +29,9 @@ from file_comm.utils.comm import (
     CommandMessage
 )
 from file_comm.utils.file import (
-    LockedTextIO
+    LockedTextIO,
+    file_lock,
+    remove_file
 )
 from file_comm.utils.parallel import (
     CommandPool,
@@ -36,8 +40,10 @@ from file_comm.utils.parallel import (
 )
 from file_comm.utils import (
     polling,
-    config
+    config,
+    timestamp_to_str
 )
+from file_comm.utils.logging import logger
 from . import ServerInfo, SessionInfo, dispatch_action, ActionFunc
 
 
@@ -109,21 +115,46 @@ class Server(LifecycleRun):
         self.server_info = ServerInfo(address)
         self.session_dict: Dict[str, Session] = {}
         self.cmd_pool = CommandPool(max_commands)
-        # file initialization
-        self.server_info.init_server()
-        print(f'Server initialized. Address {address} created.')
-
+    
     #
     # Running operations.
     #
 
     def before_running(self) -> bool:
-        return True
+        warning_exists_func = lambda: logger.warning(
+            f'main.listen file already exists at {self.server_info.address}, '
+            'may be another server is running at the same address. Check the '
+            'address setting and if you are sure no other servers are running '
+            'at the address, you may need to manually remove the file: '
+            f'{self.server_info.main_fp}.'
+        )
+        
+        main_fp = self.server_info.main_fp
+        main_check_fp = self.server_info.main_check_fp
+        address = self.server_info.address
+        if os.path.exists(main_fp):
+            warning_exists_func()
+            return False
+        
+        # NOTE: should makedirs here to successfully acquire the 
+        # main check file lock.
+        os.makedirs(address, exist_ok=True)
+        with file_lock(main_check_fp):
+            # Double check to make it safe.
+            if os.path.exists(main_fp):
+                warning_exists_func()
+                return False
+            # file initialization
+            self.server_info.init_server()
+            # NOTE: Open cmd_pool here.
+            self.cmd_pool.start()
+            logger.info(f'Server initialized. Address {address} created.')
+            return True
 
     def running(self):
         address = self.server_info.address
         
-        print(f'Server started. Listening at: {address}')
+        logger.info(f'Server started. Listening at: {address}')
         for msg in listen_messages(
             self.server_info.main_fp
         ):
@@ -132,22 +163,23 @@ class Server(LifecycleRun):
                 action(self, msg)
     
     def after_running(self, *args):
-        print('Server shutting down...')
+        logger.info('Server shutting down...')
         self.cmd_pool.pool_close.set()
         # Use a new tuple, because the ``exit_callback`` will pop 
         # the dict items.
         sessions = tuple(self.session_dict.values())
         for session in sessions:
             session.session_state.destroy_local.set()
-        print('Waiting sessions to destroy...')
+        logger.info('Waiting sessions to destroy...')
         for session in sessions:
             session.join(config.wait_timeout)
         if any(map(lambda session: session.is_alive(), sessions)):
-            print(
+            logger.warning(
                 'Warning: there are still sessions undestroyed. Ignoring and shutdown...'
             )
         else:
-            print('Successfully shutdown. Bye.')
+            logger.info('Successfully shutdown. Bye.')
+        self.server_info.clear_server()
     
     @action_registry(key='new_session')
     def create_new_session(self, msg: Message):
@@ -165,8 +197,8 @@ class Server(LifecycleRun):
             exit_callbacks=[destroy_session_func]
         )
         if session_id in self.session_dict:
-            print(
-                f'Warning: session_id {session_id} already exists and the creation will be ignored.'
+            logger.warning(
+                f'Session_id {session_id} already exists and the creation will be ignored.'
             )
             return
         
@@ -177,8 +209,8 @@ class Server(LifecycleRun):
     def destroy_session(self, msg: Message):
         session_id = msg.content or msg.session_id
         if session_id not in self.session_dict:
-            print(
-                f'Warning: Session id {session_id} not in the session dict.'
+            logger.warning(
+                f'Session id {session_id} not in the session dict.'
             )
             return
         session = self.session_dict[session_id]
@@ -215,9 +247,11 @@ class Session(LifecycleRun, Thread, Connection):
         self.running_cmd: Union[Command, None] = None
         self.running_cmd_lock = RLock()
         self.background_cmds = BackgroundCommandList()
+        # Created time.
+        self.created_timestamp = time.time()
         # file initialization
         self.session_info.init_session()
-        print(f'Session {self.session_info.session_id} created.')
+        logger.info(f'Session {self.session_info.session_id} created.')
     
     @property
     def cmd_pool(self) -> CommandPool:
@@ -256,6 +290,7 @@ class Session(LifecycleRun, Thread, Connection):
     def after_running(self, *args):
         # Further confirm the command is terminated.
         self.safely_terminate_cmd(cause='destroy')
+        self.clear_cache()
     
     #
     # Actions.
@@ -350,8 +385,8 @@ class Session(LifecycleRun, Thread, Connection):
                 cmd = self.running_cmd
             
             if self.running_cmd is not cmd:
-                print(
-                    f'Warning: Running cmd inconsistency occurred.'
+                logger.warning(
+                    f'Running cmd inconsistency occurred.'
                 )
             if not cmd:
                 return
@@ -413,8 +448,8 @@ class Session(LifecycleRun, Thread, Connection):
             self.session_info.conn_server_fp,
             remove_lockfile=True
         ):
-            print(
-                f'Warning: connection establishment failed. Missing client response. '
+            logger.warning(
+                f'Connection establishment failed. Missing client response. '
                 f'Server address: {self.session_info.address}. Session id: {self.session_info.session_id}'
             )
             return False
@@ -433,8 +468,8 @@ class Session(LifecycleRun, Thread, Connection):
                 not wait_symbol(disconn_confirm_to_server_fp) or 
                 not wait_symbol(disconn_server_fp)
             ):
-                print(
-                    'Warning: disconnection from client is not responded, '
+                logger.warning(
+                    'Disconnection from client is not responded, '
                     'ignore and continue...'
                 )
             create_symbol(disconn_confirm_to_client_fp)
@@ -443,11 +478,11 @@ class Session(LifecycleRun, Thread, Connection):
             self.safely_terminate_cmd(cause='remote')
             create_symbol(disconn_client_fp)
             if not wait_symbol(disconn_confirm_to_server_fp):
-                print(
-                    'Warning: disconnection from client is not responded, '
+                logger.warning(
+                    'Disconnection from client is not responded, '
                     'ignore and continue...'
                 )
-        print(
+        logger.info(
             f'Successfully disconnect session: {self.session_info.session_id}'
         )
     
@@ -475,11 +510,18 @@ class Session(LifecycleRun, Thread, Connection):
         """
         Clear the cached files.
         """
-        pass
+        with file_lock(self.session_info.clear_lock_fp):
+            remove_file(self.session_info.server_fp, remove_lockfile=True)
+            client_destroyed = (not os.path.exists(self.session_info.client_fp))
+        if client_destroyed:
+            # The final clear operation should be done 
+            # here if the client is already destroyed.
+            self.session_info.clear_session()
     
     def to_str(self) -> str:
         return (
-            f'Session(session_id={self.session_info.session_id})'
+            f'Session(session_id="{self.session_info.session_id}", '
+            f'created_time={timestamp_to_str(self.created_timestamp)})'
         )
 
 
@@ -601,7 +643,9 @@ class Command(LifecycleRun, Thread):
     
     def to_str(self) -> str:
         return (
-            f'Command(cmd={self.msg.content}, cmd_id={self.msg.cmd_id})'
+            f'Command(cmd="{self.msg.content}", cmd_id="{self.msg.cmd_id}", '
+            f'session_id="{self.session_info.session_id}", '
+            f'created_time={timestamp_to_str(self.msg.timestamp)})'
         )
 
 
@@ -668,7 +712,7 @@ class InnerCommand(Command):
             )
             return
         output_f.print__('Background commands:')
-        for index, cmd in enumerate(background_cmds.update_and_get()):
+        for index, cmd in enumerate(tuple(background_cmds.update_and_get())):
             output_f.print__(
                 f'{index}. {cmd.to_str()}'
             )
@@ -687,10 +731,7 @@ class InnerCommand(Command):
     @inner_cmd_registry(key='ls-cmd')
     def list_cmd(self, output_f: LockedTextIO):
         cmd_pool = self.session.cmd_pool
-        with (
-            cmd_pool.queue_lock,
-            cmd_pool.execute_lock
-        ):
+        with cmd_pool.queue_lock, cmd_pool.execute_lock:
             output_f.print__('Executing:')
             if len(cmd_pool.execute) == 0:
                 output_f.print__('No executing.')
