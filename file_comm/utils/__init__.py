@@ -21,6 +21,9 @@ class Config:
     
     def __init__(self) -> None:
         self.polling_interval = 0.5
+        # NOTE: The cli cmd is responsible for content output, 
+        # so the polling interval should be short.
+        self.cli_cmd_polling_interval = 0.01
         self.cmd_pool_schedule_interval = 0.5
         # Common wait timeout.
         self.wait_timeout = 10.0
