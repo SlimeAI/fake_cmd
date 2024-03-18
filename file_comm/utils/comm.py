@@ -5,25 +5,34 @@ import os
 import json
 import time
 import uuid
-from abc import ABC, abstractmethod
+from itertools import filterfalse
+from threading import RLock
+from abc import ABC, abstractmethod, ABCMeta
+from slime_core.utils.base import (
+    BaseList
+)
 from slime_core.utils.metabase import (
-    ReadonlyAttr
+    ReadonlyAttr,
+    _ReadonlyAttrMetaclass
+)
+from slime_core.utils.metaclass import (
+    Metaclasses
 )
 from slime_core.utils.typing import (
     Dict,
     Any,
     Union,
     Missing,
-    MISSING
+    MISSING,
+    List,
+    Literal
 )
 from . import polling, config
 from .logging import logger
 from .file import (
-    pop_first_line,
-    append_line,
-    wait_file,
-    create_empty_file,
-    remove_file
+    remove_file_with_retry,
+    check_single_writer_lock,
+    single_writer_lock
 )
 
 
@@ -34,26 +43,24 @@ class Message(ReadonlyAttr):
     readonly_attr__ = (
         'session_id',
         'msg_id',
-        'target_fp',
-        'confirm_namespace'
+        'timestamp'
     )
     
     json_attrs = (
         'session_id',
-        'target_fp',
-        'confirm_namespace',
         'type',
         'content',
         'timestamp',
         'msg_id'
     )
+    # Separator to sep the send fname components. Used 
+    # for file sorting.
+    send_fname_sep = '__'
     
     def __init__(
         self,
         *,
         session_id: str,
-        target_fp: str,
-        confirm_namespace: str,
         type: str,
         content: Union[str, dict, list, None] = None,
         timestamp: Union[float, None] = None,
@@ -61,7 +68,6 @@ class Message(ReadonlyAttr):
     ) -> None:
         """
         - ``session_id``: The connection session id.
-        - ``target_fp``: The target file path to be sent to.
         - ``confirm_namespace``: The confirmation namespace for reliable 
         information transfer.
         - ``type``: The message type (for different actions).
@@ -70,8 +76,6 @@ class Message(ReadonlyAttr):
         - ``msg_id``: A unique message id.
         """
         self.session_id = session_id
-        self.target_fp = target_fp
-        self.confirm_namespace = confirm_namespace
         self.type = type
         self.content = content
         self.timestamp = timestamp or time.time()
@@ -85,21 +89,18 @@ class Message(ReadonlyAttr):
         return f'{self.msg_id}.confirm'
     
     @property
-    def confirm_fp(self) -> str:
+    def send_fname(self) -> str:
         """
-        Message confirmation file path.
+        Return the message send file name.
         """
-        return os.path.join(
-            self.confirm_namespace,
-            self.confirm_fname
-        )
+        return f'{str(self.timestamp)}{Message.send_fname_sep}{self.msg_id}.msg'
     
     @property
-    def output_fname(self) -> str:
+    def output_namespace(self) -> str:
         """
-        System output redirect file name.
+        System output redirect namespace.
         """
-        return f'{self.msg_id}.output'
+        return f'{self.msg_id}_output'
     
     def to_json(self) -> str:
         """
@@ -138,81 +139,350 @@ class CommandMessage(Message):
         return self.msg_id
 
 
-def listen_messages(fp: str):
+class SequenceFileHandler(
+    ABC,
+    ReadonlyAttr,
+    metaclass=Metaclasses(ABCMeta, _ReadonlyAttrMetaclass)
+):
     """
-    Endlessly listen new messages. If no new messages, then block.
+    Process files in a namespace with specified sorting method. 
+    Best compatible with single-writer.
     """
-    for _ in polling():
-        msg = pop_message(fp)
-        if msg:
-            yield msg
-
-
-def pop_message(fp: str) -> Union[Message, bool]:
-    """
-    Pop a new message (if any). Return ``False`` if no new messages.
-    """
-    message = pop_first_line(fp)
-    if not message:
-        return False
-    try:
-        # If the json decode fails (mostly because of file 
-        # read and written at the same time, causing file 
-        # inconsistency), directly return ``False``.
-        # Because the message will be re-sent if no confirm 
-        # file is created, the consistency is ensured.
-        msg = Message.from_json(message)
-    except Exception as e:
-        logger.error(str(e))
-        return False
-    # Create a confirmation symbol.
-    create_symbol(msg.confirm_fp)
-    return msg
-
-
-def send_message(
-    msg: Message,
-    max_retries: int = 3
-) -> bool:
-    """
-    Send a new message to ``fp``. Retry when the confirm symbol is not received, 
-    until ``max_retries`` times. Return whether the message is successfully received.
-    """
-    attempt = 0
-    msg_json = msg.to_json()
-    target_fp = msg.target_fp
-    confirm_fp = msg.confirm_fp
+    readonly_attr__ = ('namespace',)
     
-    while True:
-        attempt += 1
-        if attempt > 1:
+    def __init__(
+        self,
+        namespace: str,
+    ):
+        self.namespace = namespace
+        # file path queue, for sequence read.
+        self.fp_queue = BaseList[str]()
+        self.fp_queue_lock = RLock()
+        # read queue
+        # Contain files that have been read to avoid 
+        # repeated files.
+        self.read_queue = BaseList[str]()
+        self.read_queue_lock = RLock()
+        self.read_queue_max_size = 100
+        os.makedirs(namespace, exist_ok=True)
+    
+    def read_one(self) -> Union[str, Literal[False]]:
+        """
+        Read one sequence file (if any).
+        """
+        if not self.check_namespace():
+            return False
+        
+        with self.fp_queue_lock, self.read_queue_lock:
+            if len(self.fp_queue) == 0:
+                try:
+                    self.detect_files()
+                except Exception as e:
+                    logger.error(str(e))
+                    return False
+            
+            if len(self.fp_queue) == 0:
+                return False
+            
+            fp = self.fp_queue.pop(0)
+            if not os.path.exists(fp):
+                logger.warning(
+                    f'Message file removed after sent: {fp}'
+                )
+                return False
+            # Check repeated messages.
+            if fp in self.read_queue:
+                remove_file_with_retry(fp)
+                return False
+            
+            with open(fp, 'r') as f:
+                content = f.read()
+                remove_file_with_retry(fp)
+            
+            if len(self.read_queue) >= self.read_queue_max_size:
+                self.read_queue.pop(0)
+            self.read_queue.append(fp)
+            return content
+    
+    def read_all(self) -> str:
+        """
+        Read all the remaining content.
+        """
+        content = ''
+        while True:
+            c = self.read_one()
+            # NOTE: Use ``c is False`` rather than 
+            # ``not c`` here, because some sequence 
+            # files may contain empty content.
+            if c is False:
+                return content
+            content += c
+    
+    def write(
+        self,
+        fname: str,
+        content: str,
+        exist_ok: bool = False
+    ) -> bool:
+        """
+        Safely write a file with single writer lock. 
+        Return whether the writing operation succeeded.
+        """
+        if not self.check_namespace():
+            return False
+        
+        fp = self.get_fp(fname)
+        if (
+            os.path.exists(fp) and 
+            not exist_ok
+        ):
+            return False
+        
+        try:
+            with single_writer_lock(fp), open(fp, 'w') as f:
+                f.write(content)
+        except Exception as e:
+            logger.error(str(e))
+            return False
+        
+        return True
+    
+    def get_fp(self, fname: str) -> str:
+        """
+        Get full file path given ``fname``.
+        """
+        return os.path.join(self.namespace, fname)
+    
+    def detect_files(self) -> None:
+        """
+        Detect and sort new files in the namespace, and add them 
+        to ``fp_queue``.
+        """
+        if not self.check_namespace():
+            return
+        
+        with self.fp_queue_lock:
+            # Sort the file names.
+            fname_list = self.sort(os.listdir(self.namespace))
+            # Get the full file paths and filter files with writing lock.
+            self.fp_queue.extend(
+                filterfalse(check_single_writer_lock, map(self.get_fp, fname_list))
+            )
+    
+    @abstractmethod
+    def sort(self, fname_list: List[str]) -> List[str]:
+        """
+        Return the sorted sequence of ``fname_list``.
+        """
+        pass
+    
+    def check_namespace(self, silent: bool = False) -> bool:
+        """
+        Check whether the namespace exists.
+        """
+        namespace_exists = os.path.exists(self.namespace)
+        if not namespace_exists and not silent:
+            logger.warning(
+                f'Namespace "{self.namespace}" does not exists.'
+            )
+        return namespace_exists
+
+
+class OutputFileHandler(SequenceFileHandler):
+    """
+    OutputFileHandler is used for stdout and stderr content 
+    writing/reading.
+    """
+    # Separator to separate the fname components. Used 
+    # for file sorting.
+    fname_sep = '__'
+    
+    def write(self, content: str, exist_ok: bool = False):
+        """
+        Write a new file with timestamp name.
+        """
+        return super().write(
+            fname=self.gen_fname(),
+            content=content,
+            exist_ok=exist_ok
+        )
+    
+    def print(self, content: str, exist_ok: bool = False):
+        return self.write(f'{content}\n', exist_ok=exist_ok)
+    
+    def sort(self, fname_list: List[str]) -> List[str]:
+        """
+        Sort the output file names by timestamps.
+        """
+        def get_timestamp(fname: str) -> float:
+            """
+            Get timestamp from the file path.
+            """
+            return float(fname.split(OutputFileHandler.fname_sep)[0])
+        
+        def filter_valid_fname(fname: str) -> bool:
+            """
+            Only keep the valid fname.
+            """
+            try:
+                get_timestamp(fname)
+            except Exception:
+                remove_file_with_retry(self.get_fp(fname))
+                return False
+            return True
+        
+        return sorted(
+            filter(filter_valid_fname, fname_list),
+            key=lambda fp: get_timestamp(fp)
+        )
+    
+    def gen_fname(self) -> str:
+        """
+        Generate a unique file name with timestamp for sorting.
+        """
+        return f'{str(time.time())}{OutputFileHandler.fname_sep}{uuid.uuid4()}'
+
+
+class MessageHandler(SequenceFileHandler):
+    """
+    MessageHandler that is responsible for safe message reading and 
+    sending.
+    """
+    
+    def __init__(
+        self,
+        namespace: str,
+        max_retries: Union[int, Missing] = MISSING,
+        wait_timeout: Union[float, Missing] = MISSING
+    ) -> None:
+        SequenceFileHandler.__init__(self, namespace)
+        self.max_retries = (
+            max_retries if 
+            max_retries is not MISSING else 
+            config.send_msg_retries
+        )
+        self.wait_timeout = (
+            wait_timeout if 
+            wait_timeout is not MISSING else 
+            config.msg_confirm_wait_timeout
+        )
+    
+    def listen(self):
+        """
+        Endlessly listen messages in blocking mode.
+        """
+        for _ in polling():
+            msg = self.read_one()
+            if msg:
+                yield msg
+    
+    def read_one(self) -> Union[Message, Literal[False]]:
+        """
+        Pop a new message (if any). Return ``False`` if no new messages.
+        """
+        content = super().read_one()
+        if not content:
+            return False
+        try:
+            # If the json decode fails (mostly because of 
+            # file read and written at the same time, causing 
+            # file inconsistency), directly return ``False``. 
+            # Because the message will be re-sent if no confirm 
+            # file is created, the consistency is ensured.
+            msg = Message.from_json(content)
+        except Exception as e:
+            logger.error(str(e))
+            return False
+        # Create a confirmation symbol.
+        create_symbol(self.get_fp(msg.confirm_fname))
+        return msg
+    
+    def write(self, msg: Message) -> bool:
+        """
+        Send msg to namespace. Retry when the confirm symbol is not received, 
+        until ``max_retries`` times. Return whether the message is successfully 
+        received.
+        """
+        if not self.check_namespace():
+            return False
+        
+        attempt = 0
+        msg_json = msg.to_json()
+        max_retries = self.max_retries
+        send_fp = self.get_fp(msg.send_fname)
+        confirm_fp = self.get_fp(msg.confirm_fname)
+        while True:
+            # Avoid sending the same message.
+            if not os.path.exists(send_fp):
+                super().write(
+                    msg.send_fname,
+                    msg_json,
+                    exist_ok=False
+                )
+            
+            if wait_symbol(
+                confirm_fp,
+                timeout=self.wait_timeout
+            ):
+                return True
+            
+            # If wait symbol is False, then retry.
+            if attempt >= max_retries:
+                logger.warning(
+                    f'Message sent {attempt} times, but not responded. Expected confirm file: '
+                    f'{confirm_fp}. Message content: {msg_json}.'
+                )
+                return False
+            
+            attempt += 1
             logger.warning(
                 f'Retrying sending the message: {msg_json}'
             )
+    
+    def sort(self, fname_list: List[str]) -> List[str]:
+        """
+        Sort the message file names by timestamps.
+        """
+        def get_timestamp(fname: str) -> float:
+            """
+            Get timestamp from the file path.
+            """
+            return float(fname.split(Message.send_fname_sep)[0])
         
-        append_line(target_fp, msg_json)
-        if wait_symbol(confirm_fp, remove_lockfile=True):
+        def filter_valid_fname(fname: str) -> bool:
+            """
+            Only keep the valid fname.
+            """
+            try:
+                get_timestamp(fname)
+            except Exception:
+                remove_file_with_retry(self.get_fp(fname))
+                return False
             return True
         
-        if attempt >= max_retries:
-            logger.warning(
-                f'Message sent {attempt} times, but not responded. Expected confirm file: '
-                f'{confirm_fp}. Message content: {msg_json}.'
-            )
-            return False
+        return sorted(
+            filter(filter_valid_fname, fname_list),
+            key=lambda fp: get_timestamp(fp)
+        )
 
 
 def create_symbol(fp: str):
     """
-    Create a symbol file.
+    Create a symbol file. If ``fp`` exists, then do nothing.
     """
-    return create_empty_file(fp, True)
+    if os.path.exists(fp):
+        return
+    
+    try:
+        with single_writer_lock(fp), open(fp, 'a'):
+            pass
+    except Exception as e:
+        logger.error(str(e))
 
 
 def wait_symbol(
     fp: str,
-    timeout: Union[float, Missing] = MISSING,
-    remove_lockfile: bool = True
+    timeout: Union[float, Missing] = MISSING
 ) -> bool:
     """
     Wait a symbol file. Return ``True`` if the symbol is created 
@@ -223,28 +493,31 @@ def wait_symbol(
     """
     timeout = config.wait_timeout if timeout is MISSING else timeout
     
-    if wait_file(fp, timeout):
-        remove_symbol(fp, remove_lockfile)
-        return True
+    start = time.time()
+    for _ in polling():
+        if os.path.exists(fp):
+            remove_symbol(fp)
+            return True
+        
+        stop = time.time()
+        if (stop - start) > timeout:
+            return False
     return False
 
 
-def remove_symbol(fp: str, remove_lockfile: bool = True):
+def remove_symbol(fp: str) -> None:
     """
     Remove a symbol file.
-    
-    If ``remove_lockfile`` is ``True``, then clean the corresponding lockfile 
-    at the same time.
     """
-    remove_file(fp, remove_lockfile)
+    remove_file_with_retry(fp)
 
 
-def check_symbol(fp: str, remove_lockfile: bool = True) -> bool:
+def check_symbol(fp: str) -> bool:
     """
     Check if the symbol exists. Non-block form of ``wait_symbol``.
     """
     if os.path.exists(fp):
-        remove_symbol(fp, remove_lockfile)
+        remove_symbol(fp)
         return True
     else:
         return False
@@ -290,8 +563,8 @@ class Heartbeat:
         self.last_receive = None
         self.send_fp = send_fp
         self.last_send = None
-        self.interval = config.heart_beat_interval
-        self.timeout = config.heart_beat_timeout
+        self.interval = config.heartbeat_interval
+        self.timeout = config.heartbeat_timeout
     
     def beat(self) -> bool:
         now = time.time()

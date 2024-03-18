@@ -19,16 +19,19 @@ from slime_core.utils.typing import (
 )
 from file_comm.utils.comm import (
     Connection,
-    send_message,
     Message,
     wait_symbol,
     create_symbol,
-    pop_message,
     check_symbol,
     Heartbeat,
-    CommandMessage
+    CommandMessage,
+    MessageHandler,
+    OutputFileHandler
 )
-from file_comm.utils.file import pop_all, remove_file, file_lock
+from file_comm.utils.file import (
+    remove_file_with_retry,
+    remove_dir_with_retry
+)
 from file_comm.utils.exception import CLITerminate
 from file_comm.utils.parallel import (
     LifecycleRun
@@ -99,38 +102,6 @@ class State(ReadonlyAttr):
         self.cmd_finished.clear()
 
 
-def send_message_to_server(
-    session_info: SessionInfo,
-    *,
-    type: str,
-    content: Union[str, dict, list, None] = None
-):
-    msg = Message(
-        session_id=session_info.session_id,
-        target_fp=session_info.main_fp,
-        confirm_namespace=session_info.address,
-        type=type,
-        content=content
-    )
-    return (msg, send_message(msg))
-
-
-def send_message_to_session(
-    session_info: SessionInfo,
-    *,
-    type: str,
-    content: Union[str, dict, list, None] = None
-):
-    msg = Message(
-        session_id=session_info.session_id,
-        target_fp=session_info.server_fp,
-        confirm_namespace=session_info.session_namespace,
-        type=type,
-        content=content
-    )
-    return (msg, send_message(msg))
-
-
 class Client(
     LifecycleRun,
     Connection,
@@ -141,7 +112,10 @@ class Client(
         'session_info',
         'heartbeat',
         'state',
-        'cli'
+        'cli',
+        'server_writer',
+        'session_writer',
+        'client_listener'
     )
     
     client_registry = Registry[ActionFunc]('client_registry')
@@ -163,23 +137,26 @@ class Client(
         self.session_info = SessionInfo(address, session_id)
         self.heartbeat = Heartbeat(
             self.session_info.heartbeat_client_fp,
-            self.session_info.heartbeat_server_fp
+            self.session_info.heartbeat_session_fp
         )
         self.state = State()
         self.cli = CLI(self)
+        self.server_writer = MessageHandler(self.session_info.server_listen_namespace)
+        self.session_writer = MessageHandler(self.session_info.session_queue_namespace)
+        self.client_listener = MessageHandler(self.session_info.client_queue_namespace)
     
     #
     # Running operations.
     #
     
     def before_running(self) -> bool:
-        main_fp = self.session_info.main_fp
+        server_check_fp = self.session_info.server_check_fp
         address = self.session_info.address
         
         # Should check whether the server exists. Otherwise, 
         # ``self.connect`` will create a new ``main_fp`` file 
         # and the real server startup will fail after that.
-        if not os.path.exists(main_fp):
+        if not os.path.exists(server_check_fp):
             logger.warning(
                 f'Server address not found: {address}.'
             )
@@ -204,7 +181,7 @@ class Client(
                     if not to_be_destroyed:
                         to_be_destroyed = (not self.check_connection())
                     
-                    msg = pop_message(self.session_info.client_fp)
+                    msg = self.client_listener.read_one()
                     if to_be_destroyed and not msg:
                         # Directly return.
                         return
@@ -271,23 +248,24 @@ class Client(
         address = self.session_info.address
         session_id = self.session_info.session_id
         
-        _, res = send_message_to_server(
-            self.session_info,
-            type='new_session'
+        res = self.server_writer.write(
+            Message(
+                session_id=self.session_info.session_id,
+                type='new_session'
+            )
         )
         
         if not res:
             return False
         if not wait_symbol(
-            self.session_info.conn_client_fp,
-            remove_lockfile=True
+            self.session_info.conn_client_fp
         ):
             logger.warning(
                 f'Server connection establishment failed. Server address: {address}.'
                 f'Session id: {session_id}.'
             )
             return False
-        create_symbol(self.session_info.conn_server_fp)
+        create_symbol(self.session_info.conn_session_fp)
         return True
     
     def disconnect(self, initiator: bool):
@@ -296,8 +274,8 @@ class Client(
             f'Session: {self.session_info.session_id}.'
         )
         
-        disconn_server_fp = self.session_info.disconn_server_fp
-        disconn_confirm_to_server_fp = self.session_info.disconn_confirm_to_server_fp
+        disconn_server_fp = self.session_info.disconn_session_fp
+        disconn_confirm_to_server_fp = self.session_info.disconn_confirm_to_session_fp
         disconn_client_fp = self.session_info.disconn_client_fp
         disconn_confirm_to_client_fp = self.session_info.disconn_confirm_to_client_fp
         state = self.state
@@ -360,16 +338,9 @@ class Client(
         """
         Clear cached files.
         """
-        with file_lock(self.session_info.clear_lock_fp):
-            remove_file(self.session_info.client_fp, remove_lockfile=True)
-            session_destroyed = (not os.path.exists(self.session_info.server_fp))
-        if (
-            session_destroyed or 
-            self.state.unable_to_communicate.is_set()
-        ):
+        if self.state.unable_to_communicate.is_set():
             # The final clear operation should be done 
-            # here if the session is already destroyed 
-            # or the server is unable to communicate.
+            # here if the server is unable to communicate.
             self.session_info.clear_session()
 
 
@@ -412,6 +383,14 @@ class CLI(
     def input_hint(self) -> str:
         return f'[fake_cmd {self.server_name}] '
     
+    @property
+    def session_writer(self) -> MessageHandler:
+        return self.client.session_writer
+    
+    @property
+    def server_writer(self) -> MessageHandler:
+        return self.client.server_writer
+    
     def set_current_cmd(self, cmd: Union[CommandMessage, None]) -> None:
         with self.current_cmd_lock:
             self.current_cmd = cmd
@@ -452,7 +431,7 @@ class CLI(
                 msg = self.process_cmd(cmd)
                 if msg:
                     state.cmd_running.set()
-                    self.wait_server_cmd(msg)
+                    self.wait_session_cmd(msg)
                     self.set_current_cmd(None)
                 # No matter what happened, reset the state for the next command.
                 state.reset()
@@ -481,37 +460,33 @@ class CLI(
         
         cli_func = self.cli_registry.get(cmd, MISSING)
         if cli_func is MISSING:
-            return self.send_server_cmd(cmd, type='cmd')
+            return self.send_session_cmd(cmd, type='cmd')
         else:
             return cli_func(self, cmd)
     
-    def send_server_cmd(self, cmd: str, type: str = 'cmd') -> Union[CommandMessage, bool]:
+    def send_session_cmd(self, cmd: str, type: str = 'cmd') -> Union[CommandMessage, bool]:
         """
-        Send the command to the server.
+        Send the command to the session.
         """
-        # NOTE: The message should be manually sent rather than use 
-        # ``send_message_to_session`` in order to keep consistent 
-        # with ``self.current_cmd``
         session_info = self.session_info
         msg = CommandMessage(
             session_id=session_info.session_id,
-            target_fp=session_info.server_fp,
-            confirm_namespace=session_info.session_namespace,
             type=type,
             content=cmd
         )
         self.set_current_cmd(msg)
-        res = send_message(msg)
+        res = self.session_writer.write(msg)
         if not res:
             self.set_current_cmd(None)
             return False
         return msg
     
-    def wait_server_cmd(self, msg: CommandMessage):
+    def wait_session_cmd(self, msg: CommandMessage):
         """
-        Wait the server command to finish.
+        Wait the session command to finish.
         """
-        output_fp = self.session_info.message_output_fp(msg)
+        output_namespace = self.session_info.message_output_namespace(msg)
+        output_reader = OutputFileHandler(output_namespace)
         confirm_fp = self.session_info.command_terminate_confirm_fp(msg)
         state = self.state
         
@@ -523,10 +498,10 @@ class CLI(
                 state.cmd_finished.is_set()
             ):
                 # Clear the output before terminate.
-                self.redirect_output(output_fp)
+                self.redirect_output(output_reader, read_all=True)
                 break
             
-            has_output = self.redirect_output(output_fp)
+            has_output = self.redirect_output(output_reader, read_all=False)
             if to_be_terminated and not has_output:
                 # No more output, directly break.
                 break
@@ -537,12 +512,14 @@ class CLI(
             ):
                 # Terminate from local.
                 logger.info(
-                    f'Terminating server command: {msg.cmd_content}.'
+                    f'Terminating session command: {msg.cmd_content}.'
                 )
-                send_message_to_session(
-                    self.session_info,
-                    type='terminate_cmd',
-                    content=msg.cmd_id
+                self.session_writer.write(
+                    Message(
+                        session_id=self.session_info.session_id,
+                        type='terminate_cmd',
+                        content=msg.cmd_id
+                    )
                 )
                 remote_terminated = wait_symbol(confirm_fp, config.cmd_terminate_timeout)
                 
@@ -552,10 +529,12 @@ class CLI(
                 ):
                     # After terminate local, check force kill.
                     logger.info('Trying force kill the command...')
-                    send_message_to_session(
-                        self.session_info,
-                        type='force_kill_cmd',
-                        content=msg.cmd_id
+                    self.session_writer.write(
+                        Message(
+                            session_id=self.session_info.session_id,
+                            type='force_kill_cmd',
+                            content=msg.cmd_id
+                        )
                     )
                     remote_terminated = wait_symbol(confirm_fp, config.cmd_force_kill_timeout)
                 
@@ -568,16 +547,18 @@ class CLI(
                         f'Command may take more time to terminate, and '
                         f'it is now put to the background.'
                     )
-                    send_message_to_session(
-                        self.session_info,
-                        type='background_cmd',
-                        content=msg.cmd_id
+                    self.session_writer.write(
+                        Message(
+                            session_id=self.session_info.session_id,
+                            type='background_cmd',
+                            content=msg.cmd_id
+                        )
                     )
                 to_be_terminated = True
         
         # Remove all files.
-        remove_file(confirm_fp, remove_lockfile=True)
-        remove_file(output_fp, remove_lockfile=True)
+        remove_file_with_retry(confirm_fp)
+        remove_dir_with_retry(output_namespace)
     
     @cli_registry(key='exit')
     def cli_exit(self, cmd: str):
@@ -601,7 +582,7 @@ class CLI(
         'ls-cmd'
     ])
     def inner_cmd(self, cmd: str) -> Union[CommandMessage, bool]:
-        return self.send_server_cmd(cmd, type='inner_cmd')
+        return self.send_session_cmd(cmd, type='inner_cmd')
     
     @cli_registry(key='server_shutdown')
     def server_shutdown(self, cmd: str) -> Literal[False]:
@@ -620,21 +601,27 @@ class CLI(
                     'Server shutdown canceled.'
                 )
                 return False
-            send_message_to_server(
-                self.session_info,
-                type='server_shutdown'
+            self.server_writer.write(
+                Message(
+                    session_id=self.session_info.session_id,
+                    type='server_shutdown'
+                )
             )
         finally:
             return False
     
-    def redirect_output(self, fp: str) -> bool:
+    def redirect_output(self, reader: OutputFileHandler, read_all: bool) -> bool:
         """
         Redirect the content of ``fp`` to the cli. Return whether 
         any content exists.
         """
-        content = pop_all(fp)
+        content = ''
+        if read_all:
+            content = reader.read_all()
+        else:
+            content = reader.read_one()
         if not content:
             return False
-        sys.stderr.write(content)
-        sys.stderr.flush()
+        sys.stdout.write(content)
+        sys.stdout.flush()
         return True

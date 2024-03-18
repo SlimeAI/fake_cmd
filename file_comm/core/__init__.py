@@ -1,5 +1,4 @@
 import os
-import shutil
 from slime_core.utils.metabase import ReadonlyAttr
 from slime_core.utils.registry import Registry
 from slime_core.utils.typing import (
@@ -9,8 +8,8 @@ from slime_core.utils.typing import (
     Callable,
     Any
 )
-from file_comm.utils.comm import Message, CommandMessage
-from file_comm.utils.file import create_empty_file, remove_file, file_lock
+from file_comm.utils.comm import Message, CommandMessage, create_symbol
+from file_comm.utils.file import remove_dir_with_retry, remove_file_with_retry
 from file_comm.utils.logging import logger
 
 
@@ -19,7 +18,9 @@ class ServerInfo(ReadonlyAttr):
     Server information.
     """
     readonly_attr__ = (
-        'address'
+        'address',
+        'listen_fname',
+        'listen_namespace'
     )
     
     def __init__(
@@ -27,40 +28,35 @@ class ServerInfo(ReadonlyAttr):
         address: str
     ) -> None:
         self.address = address
-        self.main_fname = 'main.listen'
-        # Used as a file lock to check if another server is listening 
-        # the same address.
-        self.main_check = 'main.check'
+        # Used for checking whether another server is listening at the 
+        # same address.
+        self.server_check_fname = 'server.listen'
+        self.server_listen_namespace = self.concat_server_path('server_listen')
 
     @property
-    def main_fp(self) -> str:
-        return self.concat_server_fp(self.main_fname)
-
-    @property
-    def main_check_fp(self) -> str:
-        return self.concat_server_fp(self.main_check)
+    def server_check_fp(self) -> str:
+        return self.concat_server_path(self.server_check_fname)
 
     def init_server(self):
         """
         Create corresponding files. Should only be called once by server.
         """
         os.makedirs(self.address, exist_ok=True)
-        create_empty_file(self.main_fp)
+        create_symbol(self.server_check_fp)
     
     def clear_server(self):
         """
         Clear server listening files.
         """
-        with file_lock(self.main_check_fp):
-            remove_file(self.main_fp, remove_lockfile=True)
-        remove_file(self.main_check_fp, remove_lockfile=True)
+        remove_dir_with_retry(self.server_listen_namespace)
+        remove_file_with_retry(self.server_check_fp)
         try:
             # If empty, then remove.
             os.rmdir(self.address)
         except (OSError, FileNotFoundError):
             pass
     
-    def concat_server_fp(self, fname: str) -> str:
+    def concat_server_path(self, fname: str) -> str:
         return os.path.join(self.address, fname)
 
 
@@ -81,24 +77,19 @@ class SessionInfo(ServerInfo, ReadonlyAttr):
         ServerInfo.__init__(self, address)
         self.session_id = session_id
         # Message transfer.
-        self.server_fp = self.concat_session_fp('server.queue')
-        self.client_fp = self.concat_session_fp('client.queue')
+        self.session_queue_namespace = self.concat_session_path('session_queue')
+        self.client_queue_namespace = self.concat_session_path('client_queue')
         # Connect creation.
-        self.conn_server_fp = self.concat_session_fp('server.conn')
-        self.conn_client_fp = self.concat_session_fp('client.conn')
+        self.conn_session_fp = self.concat_session_path('session.conn')
+        self.conn_client_fp = self.concat_session_path('client.conn')
         # Disconnect.
-        self.disconn_server_fp = self.concat_session_fp('server.disconn')
-        self.disconn_confirm_to_server_fp = self.concat_session_fp('server.disconn.confirm')
-        self.disconn_client_fp = self.concat_session_fp('client.disconn')
-        self.disconn_confirm_to_client_fp = self.concat_session_fp('client.disconn.confirm')
+        self.disconn_session_fp = self.concat_session_path('session.disconn')
+        self.disconn_confirm_to_session_fp = self.concat_session_path('session.disconn.confirm')
+        self.disconn_client_fp = self.concat_session_path('client.disconn')
+        self.disconn_confirm_to_client_fp = self.concat_session_path('client.disconn.confirm')
         # Heartbeat.
-        self.heartbeat_server_fp = self.concat_session_fp('server.heartbeat')
-        self.heartbeat_client_fp = self.concat_session_fp('client.heartbeat')
-        # Clear lock.
-        # This lock is used to ensure the corresponding namespace will be 
-        # completely cleared after the session is destroyed, and the 
-        # destruction won't clear the reading files.
-        self.clear_lock_fp = self.concat_session_fp('clear.lock')
+        self.heartbeat_session_fp = self.concat_session_path('session.heartbeat')
+        self.heartbeat_client_fp = self.concat_session_path('client.heartbeat')
     
     @property
     def session_namespace(self) -> str:
@@ -116,35 +107,32 @@ class SessionInfo(ServerInfo, ReadonlyAttr):
     
     def init_session(self):
         """
-        Create corresponding files. Should only be called once by server.
+        Create corresponding files. Should only be called once by session.
         """
         os.makedirs(self.session_namespace, exist_ok=True)
-        create_empty_file(self.server_fp)
-        create_empty_file(self.client_fp)
+        os.makedirs(self.session_queue_namespace, exist_ok=True)
+        os.makedirs(self.client_queue_namespace, exist_ok=True)
     
     def clear_session(self):
         """
         Clear the session files.
         """
-        try:
-            shutil.rmtree(self.session_namespace)
-        except FileNotFoundError:
-            pass
+        remove_dir_with_retry(self.session_namespace)
     
-    def concat_session_fp(self, fname: str) -> str:
+    def concat_session_path(self, fname: str) -> str:
         return os.path.join(self.session_namespace, fname)
     
-    def message_output_fp(self, msg: Message) -> str:
+    def message_output_namespace(self, msg: Message) -> str:
         """
-        Get the message output file path.
+        Get the message output namespace.
         """
-        return self.concat_session_fp(msg.output_fname)
+        return self.concat_session_path(msg.output_namespace)
     
     def command_terminate_confirm_fp(self, msg: CommandMessage) -> str:
         """
         Get the command terminate confirm fp.
         """
-        return self.concat_session_fp(msg.cmd_id)
+        return self.concat_session_path(f'{msg.cmd_id}.term')
 
 
 ActionFunc = Callable[[Any, Message], None]
