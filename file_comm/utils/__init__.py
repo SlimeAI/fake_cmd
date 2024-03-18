@@ -18,8 +18,8 @@ class Config:
         self.cmd_terminate_timeout = 20.0
         self.cmd_force_kill_timeout = 5.0
         # Heartbeat settings.
-        self.heart_beat_interval = 3.0
-        self.heart_beat_timeout = 10.0
+        self.heart_beat_interval = 10.0
+        self.heart_beat_timeout = 120.0
 
 
 config = Config()
