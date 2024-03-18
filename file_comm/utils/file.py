@@ -23,11 +23,14 @@ def remove_dir_with_retry(namespace: str):
         pass
 
 
+SINGLE_WRITER_LOCK_FILE_EXTENSION = 'writing'
+
+
 def get_single_writer_lock_fp(fp: str) -> str:
     """
     Return the writing lock file path.
     """
-    return f'{fp}.writing'
+    return f'{fp}.{SINGLE_WRITER_LOCK_FILE_EXTENSION}'
 
 
 @contextmanager

@@ -32,7 +32,8 @@ from .logging import logger
 from .file import (
     remove_file_with_retry,
     check_single_writer_lock,
-    single_writer_lock
+    single_writer_lock,
+    SINGLE_WRITER_LOCK_FILE_EXTENSION
 )
 
 
@@ -326,10 +327,10 @@ class OutputFileHandler(SequenceFileHandler):
             """
             try:
                 get_timestamp(fname)
+                return not fname.endswith(SINGLE_WRITER_LOCK_FILE_EXTENSION)
             except Exception:
                 remove_file_with_retry(self.get_fp(fname))
                 return False
-            return True
         
         return sorted(
             filter(filter_valid_fname, fname_list),
@@ -455,10 +456,10 @@ class MessageHandler(SequenceFileHandler):
             """
             try:
                 get_timestamp(fname)
+                return not fname.endswith(SINGLE_WRITER_LOCK_FILE_EXTENSION)
             except Exception:
                 remove_file_with_retry(self.get_fp(fname))
                 return False
-            return True
         
         return sorted(
             filter(filter_valid_fname, fname_list),
