@@ -777,15 +777,21 @@ class ShellCommand(Command):
         selector = selectors.DefaultSelector()
         selector.register(process.stdout, selectors.EVENT_READ)
         
-        def write_output() -> str:
+        def write_output(read_all: bool) -> str:
             """
             Write stdout with non-blocking method.
             """
             for key, _ in selector.select(0):
                 if key.fileobj == process.stdout:
-                    self.output_writer.write(
-                        str(process.stdout.read())
-                    )
+                    # NOTE: ``read`` or ``readlines`` will wait until 
+                    # file ends or content reaches buffer size, so should 
+                    # use ``readline`` for realtime output, and use 
+                    # ``read`` to get all the remaining content when exit.
+                    if read_all:
+                        content = str(process.stdout.read())
+                    else:
+                        content = str(process.stdout.readline())
+                    self.output_writer.write(content)
         
         # Set process.
         self.process = process
@@ -814,10 +820,10 @@ class ShellCommand(Command):
                 except TimeoutExpired:
                     process.terminate()
             # Write outputs.
-            write_output()
+            write_output(read_all=False)
             
             if process.poll() is not None:
-                write_output()
+                write_output(read_all=True)
                 break
         
         if not state.pending_terminate:
