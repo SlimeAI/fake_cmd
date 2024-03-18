@@ -27,7 +27,7 @@ from slime_core.utils.typing import (
     List,
     Literal
 )
-from . import polling, config
+from . import polling, config, xor__
 from .logging import logger
 from .file import (
     remove_file_with_retry,
@@ -482,20 +482,24 @@ def create_symbol(fp: str):
 
 def wait_symbol(
     fp: str,
-    timeout: Union[float, Missing] = MISSING
+    timeout: Union[float, Missing] = MISSING,
+    wait_for_remove: bool = False
 ) -> bool:
     """
     Wait a symbol file. Return ``True`` if the symbol is created 
     before timeout, otherwise ``False``.
     
-    If the symbol file is a one-time symbol, then set ``remove_lockfile`` 
-    to ``True`` to clean the corresponding lockfile.
+    ``wait_for_remove``: whether the function is used to wait for 
+    removing the symbol or creating the symbol.
     """
     timeout = config.wait_timeout if timeout is MISSING else timeout
     
     start = time.time()
     for _ in polling():
-        if os.path.exists(fp):
+        if xor__(
+            os.path.exists(fp),
+            wait_for_remove
+        ):
             remove_symbol(fp)
             return True
         

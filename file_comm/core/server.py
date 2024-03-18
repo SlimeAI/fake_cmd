@@ -530,8 +530,8 @@ class Session(
         return True
     
     def disconnect(self, initiator: bool):
-        disconn_server_fp = self.session_info.disconn_session_fp
-        disconn_confirm_to_server_fp = self.session_info.disconn_confirm_to_session_fp
+        disconn_session_fp = self.session_info.disconn_session_fp
+        disconn_confirm_to_session_fp = self.session_info.disconn_confirm_to_session_fp
         disconn_client_fp = self.session_info.disconn_client_fp
         disconn_confirm_to_client_fp = self.session_info.disconn_confirm_to_client_fp
         
@@ -539,8 +539,8 @@ class Session(
             self.safely_terminate_cmd(cause='disconnect')
             create_symbol(disconn_client_fp)
             if (
-                not wait_symbol(disconn_confirm_to_server_fp) or 
-                not wait_symbol(disconn_server_fp)
+                not wait_symbol(disconn_confirm_to_session_fp) or 
+                not wait_symbol(disconn_session_fp)
             ):
                 logger.warning(
                     'Disconnection from client is not responded, '
@@ -553,7 +553,7 @@ class Session(
             create_symbol(disconn_confirm_to_client_fp)
             self.safely_terminate_cmd(cause='remote')
             create_symbol(disconn_client_fp)
-            if not wait_symbol(disconn_confirm_to_server_fp):
+            if not wait_symbol(disconn_confirm_to_session_fp):
                 logger.warning(
                     'Disconnection from client is not responded, '
                     'ignore and continue...'
@@ -588,6 +588,13 @@ class Session(
         """
         Clear the cached files.
         """
+        if self.session_state.unable_to_communicate.is_set():
+            self.session_info.clear_session()
+            return
+        # Wait whether the client has received the final ``disconn_confirm_to_client_fp``
+        # when ``self.disconnect(initiator=True)``
+        wait_symbol(self.session_info.disconn_confirm_to_client_fp, wait_for_remove=True)
+        # Clear anyway.
         self.session_info.clear_session()
     
     def to_str(self) -> str:

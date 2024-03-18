@@ -9,7 +9,7 @@ from slime_core.utils.typing import (
     Missing,
     Callable,
     TypeVar,
-    List
+    Any
 )
 from .logging import logger
 
@@ -148,3 +148,10 @@ def retry_deco(
             )
         return wrapper
     return decorator
+
+
+def xor__(__x: Any, __y: Any) -> bool:
+    return bool(
+        (__x and not __y) or 
+        (not __x and __y)
+    )

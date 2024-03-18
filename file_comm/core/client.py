@@ -274,8 +274,8 @@ class Client(
             f'Session: {self.session_info.session_id}.'
         )
         
-        disconn_server_fp = self.session_info.disconn_session_fp
-        disconn_confirm_to_server_fp = self.session_info.disconn_confirm_to_session_fp
+        disconn_session_fp = self.session_info.disconn_session_fp
+        disconn_confirm_to_session_fp = self.session_info.disconn_confirm_to_session_fp
         disconn_client_fp = self.session_info.disconn_client_fp
         disconn_confirm_to_client_fp = self.session_info.disconn_confirm_to_client_fp
         state = self.state
@@ -286,7 +286,7 @@ class Client(
                 state.cmd_terminate_local.set()
                 state.cmd_force_kill.set()
                 # Send to server to disconnect.
-                create_symbol(disconn_server_fp)
+                create_symbol(disconn_session_fp)
                 if (
                     not wait_symbol(disconn_confirm_to_client_fp) or 
                     not wait_symbol(disconn_client_fp)
@@ -297,15 +297,15 @@ class Client(
                     )
                     # Set that the server is unable to communicate.
                     state.unable_to_communicate.set()
-                create_symbol(disconn_confirm_to_server_fp)
+                create_symbol(disconn_confirm_to_session_fp)
                 state.terminate.set()
         else:
             with state.terminate_lock:
                 # Use lock to make it consistent.
-                create_symbol(disconn_confirm_to_server_fp)
+                create_symbol(disconn_confirm_to_session_fp)
                 # Send remaining messages.
                 state.cmd_terminate_remote.set()
-                create_symbol(disconn_server_fp)
+                create_symbol(disconn_session_fp)
                 if not wait_symbol(disconn_confirm_to_client_fp):
                     logger.warning(
                         'Disconnection from server is not responded, '
