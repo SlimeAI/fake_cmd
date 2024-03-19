@@ -1,5 +1,4 @@
 import os
-import cmd
 import sys
 import uuid
 import traceback
@@ -51,7 +50,7 @@ CLIENT_HELP = """
 NOTE: ``Ctrl+C`` won't start a new line. Use ``Ctrl+C`` and ``enter`` instead.
 Inner command help:
 ``help``: Get the help document.
-``exit``: Shutdown the client, disconnect session.
+``exit``: Shutdown the client, disconnect session (or use ``Ctrl+D`` is also allowed).
 ``sid``: Get the sid of the client.
 ``ls-session``: List all the alive sessions.
 ``ls-cmd``: List all the commands executing or queued.
@@ -410,7 +409,7 @@ class CLI(
     
     @property
     def input_hint(self) -> str:
-        return f'[fake_cmd {self.server_name}] '
+        return f'[fake_cmd {self.server_name}]$ '
     
     @property
     def session_writer(self) -> MessageHandler:
@@ -433,7 +432,6 @@ class CLI(
     
     def running(self):
         state = self.state
-        cli_input = Input(self.input_hint)
         
         def safe_check_terminate() -> bool:
             """
@@ -454,7 +452,7 @@ class CLI(
                     # The terminate state should be checked before and after the 
                     # cmd input.
                     if safe_check_terminate(): return
-                    cmd = cli_input.cmdloop()
+                    cmd = input(self.input_hint)
                     if safe_check_terminate(): return
                     if state.get_keyboard_interrupt() > 0:
                         # If keyboard interrupt pressed, directly ignore the cmd.
@@ -467,10 +465,9 @@ class CLI(
                     if msg:
                         self.wait_session_cmd(msg)
                         self.set_current_cmd(None)
-            except CLITerminate:
+            except (CLITerminate, EOFError):
+                print('CLI exiting...')
                 return
-            except EOFError:
-                pass
             except:
                 traceback.print_exc()
     
@@ -695,49 +692,4 @@ class CLI(
             return False
         sys.stdout.write(content)
         sys.stdout.flush()
-        return True
-
-
-class Input(cmd.Cmd):
-    
-    eof_content = 'EOF'
-    
-    def __init__(
-        self,
-        prompt: str
-    ):
-        super().__init__()
-        self.prompt = prompt
-        self.cmd: Union[str, None] = None
-    
-    def cmdloop(self, intro: Union[Any, None] = None) -> Union[str, None]:
-        """
-        Return the one command content (if any).
-        """
-        self.cmd = None
-        super().cmdloop(intro)
-        cmd, self.cmd = self.cmd, None
-        return cmd
-    
-    def onecmd(self, line: str) -> bool:
-        """
-        Process one command and directly stop.
-        """
-        if (
-            line and 
-            line != self.eof_content
-        ):
-            self.cmd = line
-        return True
-    
-    def postcmd(self, stop: bool, line: str) -> bool:
-        """
-        Directly return ``True`` to end the command.
-        """
-        return True
-    
-    def emptyline(self) -> bool:
-        """
-        NOTE: DO NOT repeat user cmd when empty line.
-        """
         return True

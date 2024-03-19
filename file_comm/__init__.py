@@ -12,3 +12,9 @@ for the main server namespace.
 - About server and client naming: ``server`` means message sent to 
 server, so does ``client``.
 """
+
+# NOTE: Import ``readline`` here to improve input experience.
+try:
+    import readline
+except Exception:
+    pass
