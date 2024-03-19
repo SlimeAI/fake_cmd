@@ -3,6 +3,7 @@ import cmd
 import sys
 import uuid
 import traceback
+from contextlib import contextmanager
 from threading import Thread, Event, RLock
 from abc import ABCMeta
 from slime_core.utils.metabase import ReadonlyAttr
@@ -47,7 +48,7 @@ from file_comm.utils.logging import logger
 from . import SessionInfo, ActionFunc, dispatch_action
 
 CLIENT_HELP = """
-NOTE: Use ``Ctrl+C`` AND ``Ctrl+D`` to start a new line.
+NOTE: ``Ctrl+C`` won't start a new line. Use ``Ctrl+C`` and ``enter`` instead.
 Inner command help:
 ``help``: Get the help document.
 ``exit``: Shutdown the client, disconnect session.
@@ -65,9 +66,9 @@ class State(ReadonlyAttr):
     """
     readonly_attr__ = (
         'cmd_running',
-        'cmd_terminate_local',
         'cmd_terminate_remote',
-        'cmd_force_kill',
+        'keyboard_interrupt_lock',
+        'keyboard_interrupt_max_cnt',
         'cmd_finished',
         'terminate',
         'terminate_lock',
@@ -77,14 +78,14 @@ class State(ReadonlyAttr):
     def __init__(self) -> None:
         # Indicator that whether a command is running.
         self.cmd_running = Event()
-        # Command terminate from local.
-        self.cmd_terminate_local = Event()
         # Command terminated from remote.
         self.cmd_terminate_remote = Event()
-        # Command force kill.
-        # NOTE: The force kill is always set after 
-        # ``cmd_terminate_local``.
-        self.cmd_force_kill = Event()
+        # Counting the "KeyboardInterrupt" Events.
+        self.keyboard_interrupt_lock = RLock()
+        self.keyboard_interrupt = 0
+        # NOTE: Avoid endless Keyboard Interrupt from a 
+        # process, which may cause integer overflow.
+        self.keyboard_interrupt_max_cnt = 10
         # Command finished.
         self.cmd_finished = Event()
         # CLI terminate indicator.
@@ -98,10 +99,37 @@ class State(ReadonlyAttr):
     
     def reset(self) -> None:
         self.cmd_running.clear()
-        self.cmd_terminate_local.clear()
         self.cmd_terminate_remote.clear()
-        self.cmd_force_kill.clear()
+        # Reset the keyboard interrupt.
+        self.reset_keyboard_interrupt()
         self.cmd_finished.clear()
+    
+    @contextmanager
+    def reset_ctx(self):
+        """
+        State reset context manager.
+        """
+        self.reset()
+        try:
+            yield
+        finally:
+            self.reset()
+
+    def add_keyboard_interrupt(self) -> None:
+        with self.keyboard_interrupt_lock:
+            if (
+                self.keyboard_interrupt >= self.keyboard_interrupt_max_cnt
+            ):
+                return
+            self.keyboard_interrupt += 1
+    
+    def reset_keyboard_interrupt(self) -> None:
+        with self.keyboard_interrupt_lock:
+            self.keyboard_interrupt = 0
+
+    def get_keyboard_interrupt(self) -> int:
+        with self.keyboard_interrupt_lock:
+            return self.keyboard_interrupt
 
 
 class Client(
@@ -197,13 +225,11 @@ class Client(
                     if action is not MISSING:
                         action(self, msg)
             except KeyboardInterrupt:
-                print('Keyboard Interrupt.')
-                if state.cmd_running.is_set():
-                    if state.cmd_terminate_local.is_set():
-                        print('Force kill set.')
-                        # Double "Ctrl + C" to force kill the command.
-                        state.cmd_force_kill.set()
-                    state.cmd_terminate_local.set()
+                print(
+                    'Keyboard Interrupt. (Use "Ctrl + C" and "enter" '
+                    'to start a new input line)'
+                )
+                state.add_keyboard_interrupt()
             except:
                 traceback.print_exc()
     
@@ -285,8 +311,9 @@ class Client(
             with state.terminate_lock:
                 # Use lock to make it consistent.
                 # Send remaining messages before disconnect.
-                state.cmd_terminate_local.set()
-                state.cmd_force_kill.set()
+                # Add twice to force kill.
+                state.add_keyboard_interrupt()
+                state.add_keyboard_interrupt()
                 # Send to server to disconnect.
                 create_symbol(disconn_session_fp)
                 if (
@@ -422,22 +449,24 @@ class CLI(
         
         while True:
             try:
-                # The terminate state should be checked before and after the 
-                # cmd input.
-                if safe_check_terminate(): return
-                cmd = cli_input.cmdloop()
-                if safe_check_terminate(): return
-                # NOTE: the state reset should be in front of the command sent 
-                # to the server.
-                state.reset()
-                # NOTE: the command has already been sent to the server here.
-                msg = self.process_cmd(cmd)
-                if msg:
-                    state.cmd_running.set()
-                    self.wait_session_cmd(msg)
-                    self.set_current_cmd(None)
-                # No matter what happened, reset the state for the next command.
-                state.reset()
+                # Command input.
+                with state.reset_ctx():
+                    # The terminate state should be checked before and after the 
+                    # cmd input.
+                    if safe_check_terminate(): return
+                    cmd = cli_input.cmdloop()
+                    if safe_check_terminate(): return
+                    if state.get_keyboard_interrupt() > 0:
+                        # If keyboard interrupt pressed, directly ignore the cmd.
+                        continue
+                
+                # Process the command.
+                with state.reset_ctx():
+                    # NOTE: the command has already been sent to the server here.
+                    msg = self.process_cmd(cmd)
+                    if msg:
+                        self.wait_session_cmd(msg)
+                        self.set_current_cmd(None)
             except CLITerminate:
                 return
             except EOFError:
@@ -488,6 +517,9 @@ class CLI(
         """
         Wait the session command to finish.
         """
+        # Set that the command is running.
+        self.state.cmd_running.set()
+        
         output_namespace = self.session_info.message_output_namespace(msg)
         output_reader = OutputFileHandler(output_namespace)
         confirm_fp = self.session_info.command_terminate_confirm_fp(msg)
@@ -510,16 +542,15 @@ class CLI(
             
             if (
                 state.terminate.is_set() or 
-                (to_be_terminated and state.cmd_force_kill.is_set())
+                (to_be_terminated and state.get_keyboard_interrupt() > 1)
             ):
                 # ``to_be_terminated``: the client has already request the session 
                 # to terminate the command, no matter what the response is. 
-                # ``cmd_force_kill``: user press "Ctrl + C" twice, so force kill.
                 # NOTE: If cmd_terminate wait over timeout, the process will be put 
                 # to the background. However, the process may still endlessly produce 
-                # output, causing the cli unable to normally quit, so when ``cmd_force_kill``
-                # is set, read all the remaining content within a set timeout, and 
-                # directly break.
+                # output, causing the cli unable to normally quit, so when keyboard_interrupt
+                # is set more than 1, read all the remaining content within a set 
+                # timeout, and directly break.
                 self.redirect_output(
                     output_reader,
                     read_all=True,
@@ -529,7 +560,7 @@ class CLI(
             
             if (
                 (not to_be_terminated) and
-                state.cmd_terminate_local.is_set()
+                state.get_keyboard_interrupt() > 0
             ):
                 # Terminate from local.
                 logger.info(
@@ -546,7 +577,7 @@ class CLI(
                 
                 if (
                     not remote_terminated and 
-                    state.cmd_force_kill.is_set()
+                    state.get_keyboard_interrupt() > 1
                 ):
                     # After terminate local, check force kill.
                     logger.info('Trying force kill the command...')
