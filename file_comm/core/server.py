@@ -566,11 +566,11 @@ class Session(
         )
     
     def check_connection(self) -> bool:
-        disconn_server_fp = self.session_info.disconn_session_fp
+        disconn_session_fp = self.session_info.disconn_session_fp
         session_state = self.session_state
         
         with self.running_cmd_lock:
-            if check_symbol(disconn_server_fp):
+            if check_symbol(disconn_session_fp):
                 self.disconnect(initiator=False)
                 return False
             elif (

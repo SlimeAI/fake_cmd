@@ -27,7 +27,7 @@ from slime_core.utils.typing import (
     List,
     Literal
 )
-from . import polling, config, xor__
+from . import polling, config, xor__, retry_deco
 from .logging import logger
 from .file import (
     remove_file_with_retry,
@@ -493,6 +493,7 @@ class MessageHandler(SequenceFileHandler):
         )
 
 
+@retry_deco(suppress_exc=Exception)
 def create_symbol(fp: str):
     """
     Create a symbol file. If ``fp`` exists, then do nothing.
@@ -500,11 +501,8 @@ def create_symbol(fp: str):
     if os.path.exists(fp):
         return
     
-    try:
-        with single_writer_lock(fp), open(fp, 'a'):
-            pass
-    except Exception as e:
-        logger.error(str(e))
+    with single_writer_lock(fp), open(fp, 'a'):
+        pass
 
 
 def wait_symbol(
