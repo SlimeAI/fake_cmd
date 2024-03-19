@@ -620,7 +620,19 @@ class CLI(
             content = reader.read_all()
         else:
             content = reader.read_one()
-        if not content:
+        # NOTE: If ``read_all`` is ``True``, then we can 
+        # directly judge there is no content to read and 
+        # return ``False``. However, if ``read_all`` is 
+        # ``False``, we just read one file from the 
+        # namespace, and if ``content`` is an empty str, 
+        # it does not represent that no more content is 
+        # available, so we should judge whether ``content``
+        # is exactly ``False`` rather than using 
+        # ``not content``.
+        if (
+            (read_all and (not content)) or 
+            ((not read_all) and content is False)
+        ):
             return False
         sys.stdout.write(content)
         sys.stdout.flush()
