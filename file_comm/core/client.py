@@ -692,12 +692,21 @@ class Input(cmd.Cmd):
         """
         Process one command and directly stop.
         """
-        if line != self.eof_content:
+        if (
+            line and 
+            line != self.eof_content
+        ):
             self.cmd = line
         return True
     
     def postcmd(self, stop: bool, line: str) -> bool:
         """
         Directly return ``True`` to end the command.
+        """
+        return True
+    
+    def emptyline(self) -> bool:
+        """
+        NOTE: DO NOT repeat user cmd when empty line.
         """
         return True
