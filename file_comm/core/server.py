@@ -23,7 +23,8 @@ from slime_core.utils.typing import (
     Literal,
     Callable,
     Any,
-    Nothing
+    Nothing,
+    IO
 )
 from file_comm.utils.comm import (
     Connection,
@@ -195,7 +196,7 @@ class Server(
             session.session_state.destroy_local.set()
         logger.info('Waiting sessions to destroy...')
         for session in sessions:
-            session.join(config.wait_timeout)
+            session.join(config.server_shutdown_wait_timeout)
         if any(map(lambda session: session.is_alive(), sessions)):
             logger.warning(
                 'Warning: there are still sessions undestroyed. Ignoring and shutdown...'
@@ -667,12 +668,12 @@ class Command(
             cmd_state.force_kill.is_set()
         ):
             create_symbol(
-                self.session_info.command_terminate_confirm_fp(self.msg)
+                session_info.command_terminate_confirm_fp(self.msg)
             )
         elif cmd_state.terminate_local.is_set():
             self.client_writer.write(
                 Message(
-                    session_id=self.session_info.session_id,
+                    session_id=session_info.session_id,
                     type='cmd_terminated',
                     content=self.cmd_id
                 )
@@ -680,7 +681,7 @@ class Command(
         elif cmd_state.finished.is_set():
             self.client_writer.write(
                 Message(
-                    session_id=self.session_info.session_id,
+                    session_id=session_info.session_id,
                     type='cmd_finished',
                     content=self.cmd_id
                 )
@@ -773,29 +774,14 @@ class ShellCommand(Command):
             stderr=subprocess.STDOUT,
             text=True
         )
-        # NOTE: Use ``selector`` to get non-blocking outputs.
-        selector = selectors.DefaultSelector()
-        selector.register(process.stdout, selectors.EVENT_READ)
-        
-        def write_output(read_all: bool) -> str:
-            """
-            Write stdout with non-blocking method.
-            """
-            for key, _ in selector.select(0):
-                if key.fileobj == process.stdout:
-                    # NOTE: ``read`` or ``readlines`` will wait until 
-                    # file ends or content reaches buffer size, so should 
-                    # use ``readline`` for realtime output, and use 
-                    # ``read`` to get all the remaining content when exit.
-                    if read_all:
-                        content = str(process.stdout.read())
-                    else:
-                        content = str(process.stdout.readline())
-                    self.output_writer.write(content)
+        reader = PipeReader(
+            process.stdout,
+            config.cmd_pipe_read_timeout
+        )
         
         # Set process.
         self.process = process
-        while True:
+        for _ in polling(config.cmd_polling_interval):
             # NOTE: DO NOT return after the signal is sent, 
             # and it should always wait until the process 
             # killed.
@@ -820,10 +806,10 @@ class ShellCommand(Command):
                 except TimeoutExpired:
                     process.terminate()
             # Write outputs.
-            write_output(read_all=False)
+            self.output_writer.write(reader.read())
             
             if process.poll() is not None:
-                write_output(read_all=True)
+                self.output_writer.write(reader.read_all())
                 break
         
         if not state.pending_terminate:
@@ -943,3 +929,66 @@ class BackgroundCommandList(
         """
         self.update_command_states__()
         return self
+
+
+class PipeReader(ReadonlyAttr):
+    """
+    Non-blocking read stdout pipes within timeout.
+    """
+    readonly_attr__ = (
+        'stdout',
+        'selector',
+        'timeout'
+    )
+    
+    def __init__(
+        self,
+        stdout: IO,
+        timeout: float
+    ) -> None:
+        self.stdout = stdout
+        # NOTE: Use ``selector`` to get non-blocking outputs.
+        self.selector = selectors.DefaultSelector()
+        self.selector.register(stdout, selectors.EVENT_READ)
+        self.timeout = timeout
+    
+    def read(self) -> str:
+        """
+        Read the content within the timeout. This method 
+        concat the results of ``_selector_read_one`` within 
+        the timeout and return.
+        """
+        start = time.time()
+        content = ''
+        while True:
+            content += self._selector_read_one()
+            stop = time.time()
+            if (stop - start) > self.timeout:
+                break
+        return content
+    
+    def read_all(self) -> str:
+        """
+        Read all the content util file end. Make sure the 
+        process is end when you call ``read_all``, else the 
+        read will be blocked.
+        """
+        # Non-blocking mode.
+        for key, _ in self.selector.select(0):
+            if key.fileobj == self.stdout:
+                # If ready, read all and return.
+                return str(self.stdout.read())
+        # If not ready, directly return empty str.
+        return ''
+    
+    def _selector_read_one(self) -> str:
+        """
+        Read one char if selector is ready.
+        """
+        # Non-blocking mode.
+        for key, _ in self.selector.select(0):
+            if key.fileobj == self.stdout:
+                # If ready, read one char and return.
+                return str(self.stdout.read(1))
+        # If no output, directly return empty str.
+        return ''

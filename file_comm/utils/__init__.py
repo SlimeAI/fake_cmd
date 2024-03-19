@@ -20,12 +20,18 @@ _CallableT = TypeVar("_CallableT", bound=Callable)
 class Config:
     
     def __init__(self) -> None:
+        # Common polling interval
         self.polling_interval = 0.5
-        # NOTE: The cli cmd is responsible for content output, 
+        # NOTE: The cmd is responsible for content output, 
         # so the polling interval should be short.
-        self.cli_cmd_polling_interval = 0.01
+        self.cmd_polling_interval = 0.01
+        # Read the subprocess pipe output within the timeout 
+        # and return.
+        self.cmd_pipe_read_timeout = 0.01
         self.cmd_pool_schedule_interval = 0.5
-        # Common wait timeout.
+        # Server shutdown wait timeout.
+        self.server_shutdown_wait_timeout = 5.0
+        # Common symbol wait timeout.
         self.wait_timeout = 10.0
         # Command terminate wait timeout (used by 
         # client to decide how long to wait when 

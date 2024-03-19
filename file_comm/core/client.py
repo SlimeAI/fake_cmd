@@ -491,7 +491,7 @@ class CLI(
         state = self.state
         
         to_be_terminated = False
-        for _ in polling(config.cli_cmd_polling_interval):
+        for _ in polling(config.cmd_polling_interval):
             if (
                 state.cmd_terminate_remote.is_set() or 
                 state.terminate.is_set() or 
