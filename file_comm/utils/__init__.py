@@ -28,6 +28,8 @@ class Config:
         # Read the subprocess pipe output within the timeout 
         # and return.
         self.cmd_pipe_read_timeout = 0.01
+        # command pipe output encoding method.
+        self.cmd_pipe_encoding: Union[str, None] = None
         # When ``cmd_force_kill`` is set or client terminated, 
         # read the remaining content util timeout.
         self.cmd_client_read_timeout = 1.0

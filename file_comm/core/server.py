@@ -772,7 +772,8 @@ class ShellCommand(Command):
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            text=True
+            text=True,
+            encoding=config.cmd_pipe_encoding
         )
         reader = PipeReader(
             process.stdout,

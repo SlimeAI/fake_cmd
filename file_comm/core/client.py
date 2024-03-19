@@ -1,4 +1,5 @@
 import os
+import cmd
 import sys
 import uuid
 import traceback
@@ -405,6 +406,7 @@ class CLI(
     
     def running(self):
         state = self.state
+        cli_input = Input(self.input_hint)
         
         def safe_check_terminate() -> bool:
             """
@@ -423,7 +425,7 @@ class CLI(
                 # The terminate state should be checked before and after the 
                 # cmd input.
                 if safe_check_terminate(): return
-                cmd = input(self.input_hint)
+                cmd = cli_input.cmdloop()
                 if safe_check_terminate(): return
                 # NOTE: the state reset should be in front of the command sent 
                 # to the server.
@@ -450,7 +452,7 @@ class CLI(
     # Command operations.
     #
     
-    def process_cmd(self, cmd: str) -> Union[CommandMessage, bool]:
+    def process_cmd(self, cmd: Union[str, None]) -> Union[CommandMessage, bool]:
         """
         Process the input cmd. Return a ``CommandMessage`` object if the 
         cmd should be executed in the server and it is successfully received, 
@@ -662,4 +664,40 @@ class CLI(
             return False
         sys.stdout.write(content)
         sys.stdout.flush()
+        return True
+
+
+class Input(cmd.Cmd):
+    
+    eof_content = 'EOF'
+    
+    def __init__(
+        self,
+        prompt: str
+    ):
+        super().__init__()
+        self.prompt = prompt
+        self.cmd: Union[str, None] = None
+    
+    def cmdloop(self, intro: Union[Any, None] = None) -> Union[str, None]:
+        """
+        Return the one command content (if any).
+        """
+        self.cmd = None
+        super().cmdloop(intro)
+        cmd, self.cmd = self.cmd, None
+        return cmd
+    
+    def onecmd(self, line: str) -> bool:
+        """
+        Process one command and directly stop.
+        """
+        if line != self.eof_content:
+            self.cmd = line
+        return True
+    
+    def postcmd(self, stop: bool, line: str) -> bool:
+        """
+        Directly return ``True`` to end the command.
+        """
         return True

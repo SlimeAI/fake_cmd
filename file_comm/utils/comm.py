@@ -289,7 +289,7 @@ class SequenceFileHandler(
         with self.fp_queue_lock:
             # Sort the file names.
             fname_list = self.sort(os.listdir(self.namespace))
-            # Get the full file paths and filter files with writing lock.
+            # Get the full file paths and filter files with writer lock.
             self.fp_queue.extend(
                 filterfalse(check_single_writer_lock, map(self.get_fp, fname_list))
             )
@@ -351,6 +351,7 @@ class OutputFileHandler(SequenceFileHandler):
             """
             try:
                 get_timestamp(fname)
+                # NOTE: Should ignore the writer lock files.
                 return not fname.endswith(SINGLE_WRITER_LOCK_FILE_EXTENSION)
             except Exception:
                 remove_file_with_retry(self.get_fp(fname))
@@ -480,6 +481,7 @@ class MessageHandler(SequenceFileHandler):
             """
             try:
                 get_timestamp(fname)
+                # NOTE: Should ignore the writer lock files.
                 return not fname.endswith(SINGLE_WRITER_LOCK_FILE_EXTENSION)
             except Exception:
                 remove_file_with_retry(self.get_fp(fname))
