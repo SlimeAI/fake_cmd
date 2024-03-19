@@ -167,15 +167,26 @@ class SequenceFileHandler(
         self.read_queue_max_size = 100
         os.makedirs(namespace, exist_ok=True)
     
-    def read_one(self) -> Union[str, Literal[False]]:
+    def read_one(
+        self,
+        detect_new_files: bool = True
+    ) -> Union[str, Literal[False]]:
         """
         Read one sequence file (if any).
+        
+        ``detect_new_files``: Whether to detect new files if 
+        ``fp_queue`` is empty. If set to ``False``, then directly 
+        return ``False`` if ``fp_queue`` is empty.
         """
         if not self.check_namespace():
             return False
         
         with self.fp_queue_lock, self.read_queue_lock:
             if len(self.fp_queue) == 0:
+                if not detect_new_files:
+                    # Directly return.
+                    return False
+                
                 try:
                     self.detect_files()
                 except Exception as e:
@@ -205,19 +216,32 @@ class SequenceFileHandler(
             self.read_queue.append(fp)
             return content
     
-    def read_all(self) -> str:
+    def read_all(
+        self,
+        timeout: Union[float, Missing] = MISSING
+    ) -> str:
         """
-        Read all the remaining content.
+        Read all the remaining content (until timeout).
         """
         content = ''
+        detect_new_files = True
+        start = time.time()
         while True:
-            c = self.read_one()
+            c = self.read_one(detect_new_files=detect_new_files)
             # NOTE: Use ``c is False`` rather than 
             # ``not c`` here, because some sequence 
             # files may contain empty content.
             if c is False:
                 return content
             content += c
+            stop = time.time()
+            if (
+                timeout is not MISSING and 
+                (stop - start) > timeout
+            ):
+                # Set ``detect_new_files`` to ``False`` 
+                # and only read from existing ``fp_queue``.
+                detect_new_files = False
     
     def write(
         self,

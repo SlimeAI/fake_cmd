@@ -28,6 +28,9 @@ class Config:
         # Read the subprocess pipe output within the timeout 
         # and return.
         self.cmd_pipe_read_timeout = 0.01
+        # When ``cmd_force_kill`` is set or client terminated, 
+        # read the remaining content util timeout.
+        self.cmd_client_read_timeout = 1.0
         self.cmd_pool_schedule_interval = 0.5
         # Server shutdown wait timeout.
         self.server_shutdown_wait_timeout = 5.0

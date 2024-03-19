@@ -15,7 +15,8 @@ from slime_core.utils.typing import (
     Union,
     Callable,
     Any,
-    Literal
+    Literal,
+    Missing
 )
 from file_comm.utils.comm import (
     Connection,
@@ -494,7 +495,6 @@ class CLI(
         for _ in polling(config.cmd_polling_interval):
             if (
                 state.cmd_terminate_remote.is_set() or 
-                state.terminate.is_set() or 
                 state.cmd_finished.is_set()
             ):
                 # Clear the output before terminate.
@@ -504,6 +504,25 @@ class CLI(
             has_output = self.redirect_output(output_reader, read_all=False)
             if to_be_terminated and not has_output:
                 # No more output, directly break.
+                break
+            
+            if (
+                state.terminate.is_set() or 
+                (to_be_terminated and state.cmd_force_kill.is_set())
+            ):
+                # ``to_be_terminated``: the client has already request the session 
+                # to terminate the command, no matter what the response is. 
+                # ``cmd_force_kill``: user press "Ctrl + C" twice, so force kill.
+                # NOTE: If cmd_terminate wait over timeout, the process will be put 
+                # to the background. However, the process may still endlessly produce 
+                # output, causing the cli unable to normally quit, so when ``cmd_force_kill``
+                # is set, read all the remaining content within a set timeout, and 
+                # directly break.
+                self.redirect_output(
+                    output_reader,
+                    read_all=True,
+                    read_all_timeout=config.cmd_client_read_timeout
+                )
                 break
             
             if (
@@ -610,14 +629,21 @@ class CLI(
         finally:
             return False
     
-    def redirect_output(self, reader: OutputFileHandler, read_all: bool) -> bool:
+    def redirect_output(
+        self,
+        reader: OutputFileHandler,
+        read_all: bool,
+        read_all_timeout: Union[float, Missing] = MISSING
+    ) -> bool:
         """
         Redirect the content of ``fp`` to the cli. Return whether 
         any content exists.
+        
+        ``read_all_timeout``: only works when ``read_all`` is True.
         """
         content = ''
         if read_all:
-            content = reader.read_all()
+            content = reader.read_all(timeout=read_all_timeout)
         else:
             content = reader.read_one()
         # NOTE: If ``read_all`` is ``True``, then we can 
