@@ -769,11 +769,11 @@ class ShellCommand(Command):
         process = Popen(
             msg.content,
             shell=True,
-            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            encoding=config.cmd_pipe_encoding
+            encoding=config.cmd_pipe_encoding,
+            executable=config.cmd_executable
         )
         reader = PipeReader(
             process.stdout,
