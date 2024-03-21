@@ -55,13 +55,27 @@ from . import SessionInfo, ActionFunc, dispatch_action, param_check
 
 CLIENT_HELP = """
 NOTE: ``Ctrl+C`` won't start a new line. Use ``Ctrl+C`` and ``enter`` instead.
-Inner command help:
+
+Inner command:
 ``help``: Get the help document.
 ``exit``: Shutdown the client, disconnect session.
 ``sid``: Get the sid of the client.
 ``ls-session``: List all the alive sessions.
 ``ls-cmd``: List all the commands executing or queued.
 ``ls-back``: List the background command of the current session.
+``ls-server-version``: Show the server version (for compatibility check).
+``version_strict_on``: Set the version strict to True.
+``version_strict_off``: Set the version strict to False.
+
+Advanced Running:
+``cmd``: Run the command with advanced options (use ``cmd -h`` to get more help).
+``inter``: Run the command in the interactive mode. Input is enabled, and if you \
+want to quit, use both ``Ctrl+C`` (to terminate the command) and ``Ctrl+D`` (to \
+quit the interactive input). NOTE: Once you have inputted the ``Ctrl+D``, the \
+interactive mode will quit, and no more input content will be accepted to send \
+to the command (use ``inter -h`` to get more help).
+
+Danger Zone:
 ``server_shutdown``: Shutdown the whole server. BE CAREFUL TO USE IT!!!
 """
 
@@ -962,13 +976,21 @@ def _get_parser() -> argparse.ArgumentParser:
         '--encoding',
         default=None,
         type=str,
-        required=False
+        required=False,
+        help=(
+            'The encoding method of input and output. Should not '
+            'be specified most of the time (and leave it default).'
+        )
     )
     parser.add_argument(
         '--exec',
         default=None,
         type=str,
-        required=False
+        required=False,
+        help=(
+            'The executable script path. Should not be specified '
+            'most of the time (and leave it default).'
+        )
     )
     parser.add_argument('cmd', nargs='*')
     return parser
@@ -981,8 +1003,14 @@ def get_cmd_parser() -> argparse.ArgumentParser:
         '--stdin',
         default=None,
         type=str,
-        choices=('pipe', 'pty'),
-        required=False
+        choices=(),
+        required=False,
+        help=(
+            'The interactive input setting. Should never be '
+            'specified in ``cmd``. If you want to start the '
+            'command in an interactive mode, use ``inter`` '
+            'instead.'
+        )
     )
     return parser
 
@@ -996,6 +1024,10 @@ def get_inter_cmd_parser() -> argparse.ArgumentParser:
         default='pipe',
         type=str,
         choices=('pipe', 'pty'),
-        required=False
+        required=False,
+        help=(
+            'The interactive input setting. Specify the stdin '
+            'setting of Popen.'
+        )
     )
     return parser
