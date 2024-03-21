@@ -4,6 +4,7 @@ import uuid
 import shlex
 import argparse
 import traceback
+from functools import wraps
 from contextlib import contextmanager
 from threading import Thread, Event, RLock
 from abc import ABCMeta
@@ -46,7 +47,8 @@ from fake_cmd.utils.parallel import (
 from fake_cmd.utils import (
     config,
     polling,
-    get_server_name
+    get_server_name,
+    version_check
 )
 from fake_cmd.utils.logging import logger
 from . import SessionInfo, ActionFunc, dispatch_action, param_check
@@ -134,6 +136,29 @@ class State(ReadonlyAttr):
     def get_keyboard_interrupt(self) -> int:
         with self.keyboard_interrupt_lock:
             return self.keyboard_interrupt
+
+
+def cli_action_version_check(
+    min_version: Union[Tuple[int, int, int], None] = None,
+    max_version: Union[Tuple[int, int, int], None] = None,
+    verbose: bool = True
+):
+    def decorator(func: Callable[..., Union[CommandMessage, bool]]):
+        @wraps(func)
+        def wrapper(self: "CLI", *args, **kwds) -> Union[CommandMessage, bool]:
+            if (
+                self.version_strict and 
+                not version_check(
+                    version=self.server_version,
+                    min_version=min_version,
+                    max_version=max_version,
+                    verbose=verbose
+                )
+            ):
+                return False
+            return func(self, *args, **kwds)
+        return wrapper
+    return decorator
 
 
 class Client(
@@ -409,6 +434,9 @@ class Client(
             )
 
 
+CLIActionFunc = Callable[[Any, List[str]], Union[CommandMessage, bool]]
+
+
 class CLI(
     LifecycleRun,
     Thread,
@@ -423,7 +451,7 @@ class CLI(
         'inter_cmd_parser'
     )
     
-    cli_registry = Registry[Callable[[Any, List[str]], Union[CommandMessage, bool]]]('cli_registry')
+    cli_registry = Registry[CLIActionFunc]('cli_registry')
     
     def __init__(
         self,
@@ -460,6 +488,14 @@ class CLI(
     @property
     def server_writer(self) -> MessageHandler:
         return self.client.server_writer
+    
+    @property
+    def server_version(self) -> Union[Tuple[int, int, int], None]:
+        return self.client.server_version
+    
+    @property
+    def version_strict(self) -> bool:
+        return self.client.version_strict
     
     def set_current_cmd(self, cmd: Union[CommandMessage, None]) -> None:
         with self.current_cmd_lock:
@@ -553,6 +589,10 @@ class CLI(
         else:
             return cli_func(self, cmd_splits)
     
+    # NOTE: Use version check here. Since (0, 0, 1), the msg 
+    # content is either a dict or None, and str is no longer 
+    # supported.
+    @cli_action_version_check(min_version=(0, 0, 1))
     def send_session_cmd(
         self,
         content: dict,
@@ -712,7 +752,7 @@ class CLI(
     @cli_registry(key='ls-server-version')
     def ls_server_version(self, cmd_splits: List[str]) -> Literal[False]:
         logger.info(
-            f'Server version: {self.client.server_version}'
+            f'Server version: {self.server_version}'
         )
         return False
     
@@ -729,6 +769,7 @@ class CLI(
         return False
     
     @cli_registry(key='inter')
+    @cli_action_version_check(min_version=(0, 0, 1))
     def interactive_cmd(self, cmd_splits: List[str]) -> Union[CommandMessage, bool]:
         """
         Open command in an interactive mode.
@@ -752,6 +793,7 @@ class CLI(
         )
     
     @cli_registry(key='cmd')
+    @cli_action_version_check(min_version=(0, 0, 1))
     def escape_cmd(self, cmd_splits: List[str]) -> Union[CommandMessage, bool]:
         try:
             args = self.cmd_parser.parse_args(cmd_splits[1:])
@@ -776,6 +818,7 @@ class CLI(
         'ls-session',
         'ls-cmd'
     ])
+    @cli_action_version_check(min_version=(0, 0, 1))
     def inner_cmd(self, cmd_splits: List[str]) -> Union[CommandMessage, bool]:
         return self.send_session_cmd(
             content={

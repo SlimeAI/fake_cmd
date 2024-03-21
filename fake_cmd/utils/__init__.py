@@ -54,20 +54,32 @@ def version_check(
     version: Union[Tuple[int, int, int], None],
     *,
     min_version: Union[Tuple[int, int, int], None] = None,
-    max_version: Union[Tuple[int, int, int], None] = None
+    max_version: Union[Tuple[int, int, int], None] = None,
+    verbose: bool = True
 ) -> bool:
     """
     Check whether the server version is compatible with some client
     APIs.
     """
+    check_passed = False
     if version is None:
-        return False
+        check_passed = False
+    else:
+        version = tuple(version)
+        check_passed = (
+            ((not min_version) or version >= tuple(min_version)) and 
+            ((not max_version) or version <= tuple(max_version))
+        )
     
-    version = tuple(version)
-    return (
-        ((not min_version) or version >= tuple(min_version)) and 
-        ((not max_version) or version <= tuple(max_version))
-    )
+    if not check_passed and verbose:
+        from .logging import logger
+        logger.warning(
+            f'Version check failed, expected version: '
+            f'min: {min_version}, max: {max_version}, actual '
+            f'version: {version}. You may need to get the '
+            'latest updates.'
+        )
+    return check_passed
 
 
 def polling(
