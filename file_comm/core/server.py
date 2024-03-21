@@ -51,7 +51,6 @@ from file_comm.utils import (
 )
 from file_comm.utils.exception import ServerShutdown
 from file_comm.utils.logging import logger
-from file_comm.utils.system import send_keyboard_interrupt
 from . import ServerInfo, SessionInfo, dispatch_action, ActionFunc, param_check
 
 
@@ -917,21 +916,11 @@ class ShellCommand(Command):
                 process.kill()
             elif (
                 state.terminate_local.is_set() or 
-                state.terminate_disconnect.is_set()
+                state.terminate_disconnect.is_set() or 
+                state.terminate_remote.is_set()
             ):
                 # Terminate the process.
                 process.terminate()
-            elif state.terminate_remote.is_set():
-                # Reserve a few seconds for ``process.terminate``.
-                timeout_for_process_terminate = 5.0
-                # Terminate with keyboard interrupt.
-                send_keyboard_interrupt(process)
-                try:
-                    process.wait(
-                        config.cmd_terminate_timeout - timeout_for_process_terminate
-                    )
-                except TimeoutExpired:
-                    process.terminate()
             # Write outputs.
             self.output_writer.write(reader.read())
             

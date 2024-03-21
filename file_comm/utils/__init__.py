@@ -34,7 +34,7 @@ class Config:
         # Command terminate wait timeout (used by 
         # client to decide how long to wait when 
         # kill a command).
-        self.cmd_terminate_timeout = 20.0
+        self.cmd_terminate_timeout = 5.0
         self.cmd_force_kill_timeout = 5.0
         # Retries
         self.send_msg_retries: int = 3
