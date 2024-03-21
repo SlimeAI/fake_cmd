@@ -1,6 +1,5 @@
 import os
 import time
-from slime_core.utils.metabase import ReadonlyAttr
 from slime_core.utils.typing import (
     MISSING,
     Union,
@@ -104,54 +103,6 @@ def get_server_name(address: str) -> str:
         return possible_server_name
     else:
         return 'remote'
-
-#
-# Stream bytes service.
-#
-
-class StreamBytesParser(ReadonlyAttr):
-    """
-    Parse bytes stream eagerly.
-    """
-    readonly_attr__ = ('encoding',)
-    
-    def __init__(
-        self,
-        encoding: str = 'utf-8'
-    ) -> None:
-        self.buffer = b''
-        self.encoding = encoding
-    
-    def parse(self, data: bytes) -> str:
-        """
-        Try to parse new data with previous stream buffer.
-        """
-        if self.buffer:
-            data = self.buffer + data
-        
-        parsed = ''
-        try:
-            parsed = data.decode(encoding=self.encoding)
-        except UnicodeDecodeError as e:
-            if e.start != 0:
-                # Parse the previous right data.
-                parsed = data[:e.start].decode(encoding=self.encoding)
-                self.buffer = data[e.start:]
-            elif e.end != len(data):
-                # This means there is some error in the middle, 
-                # then directly parse the decoded str with error 
-                # replace (to explicitly show that there is an 
-                # error).
-                parsed = data.decode(encoding=self.encoding, errors='replace')
-                self.buffer = b''
-            else:
-                # The total bytes are decoded with error, should wait 
-                # the following bytes.
-                self.buffer = data
-        else:
-            # Successfully decode, clear the buffer.
-            self.buffer = b''
-        return parsed
 
 
 def xor__(__x: Any, __y: Any) -> bool:

@@ -2,7 +2,7 @@ import os
 import time
 import selectors
 import subprocess
-from subprocess import Popen, TimeoutExpired
+from subprocess import Popen
 from threading import Thread, Event, RLock
 from abc import ABCMeta
 from slime_core.utils.metabase import ReadonlyAttr
@@ -30,6 +30,7 @@ from slime_core.utils.typing import (
 from fake_cmd.utils.comm import (
     Connection,
     Message,
+    StreamBytesParser,
     create_symbol,
     wait_symbol,
     check_symbol,
@@ -46,8 +47,7 @@ from fake_cmd.utils.parallel import (
 from fake_cmd.utils import (
     polling,
     config,
-    timestamp_to_str,
-    StreamBytesParser
+    timestamp_to_str
 )
 from fake_cmd.utils.exception import ServerShutdown
 from fake_cmd.utils.logging import logger
@@ -989,6 +989,8 @@ class InnerCommand(Command):
         output_writer = self.output_writer
         cmd_pool = self.session.cmd_pool
         with cmd_pool.queue_lock, cmd_pool.execute_lock:
+            # Update the execute.
+            cmd_pool.update_and_get_execute()
             output_writer.print('Executing:')
             if len(cmd_pool.execute) == 0:
                 output_writer.print('No executing.')

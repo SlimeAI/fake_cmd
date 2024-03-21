@@ -6,6 +6,7 @@ from types import TracebackType
 from threading import RLock, Thread, Event
 from abc import ABC, abstractmethod
 from slime_core.utils.base import BaseList
+from slime_core.utils.metabase import ReadonlyAttr
 from slime_core.utils.typing import (
     List,
     Union,
@@ -66,7 +67,12 @@ class CommandWatchdog(ExitCallbacks, Thread):
         self.run_exit_callbacks__()
 
 
-class CommandPool:
+class CommandPool(ReadonlyAttr):
+    
+    readonly_attr__ = (
+        'queue_lock',
+        'execute_lock'
+    )
     
     def __init__(
         self,
@@ -157,6 +163,14 @@ class CommandPool:
             except ValueError:
                 pass
             return True
+    
+    def update_and_get_execute(self) -> List["CommandWatchdog"]:
+        with self.execute_lock:
+            self.execute = list(filter(
+                lambda exec: exec.is_alive(),
+                self.execute
+            ))
+            return self.execute
 
 
 class LifecycleRun(ExitCallbacks, ABC):
