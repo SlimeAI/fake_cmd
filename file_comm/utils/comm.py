@@ -27,7 +27,8 @@ from slime_core.utils.typing import (
     List,
     Literal
 )
-from . import polling, config, xor__, retry_deco
+from .exception import retry_deco
+from . import polling, config, xor__
 from .logging import logger
 from .file import (
     remove_file_with_retry,
@@ -63,7 +64,7 @@ class Message(ReadonlyAttr):
         *,
         session_id: str,
         type: str,
-        content: Union[str, dict, list, None] = None,
+        content: Union[dict, None] = None,
         timestamp: Union[float, None] = None,
         msg_id: Union[str, None] = None
     ) -> None:
@@ -78,6 +79,14 @@ class Message(ReadonlyAttr):
         """
         self.session_id = session_id
         self.type = type
+        if (
+            content is not None and 
+            not isinstance(content, dict)
+        ):
+            logger.warning(
+                f'Message content can only be ``dict`` or ``None``, not {str(content)}.'
+            )
+            content = {}
         self.content = content
         self.timestamp = timestamp or time.time()
         self.msg_id = msg_id or str(uuid.uuid4())
@@ -130,10 +139,36 @@ class CommandMessage(Message):
     """
     Create alias names of the message attributes for better understanding.
     """
+    readonly_attr__ = ('interactive',)
+    
+    def __init__(
+        self,
+        *,
+        session_id: str,
+        type: str,
+        content: Union[str, dict, list, None] = None,
+        timestamp: Union[float, None] = None,
+        msg_id: Union[str, None] = None,
+        interactive: Union[bool, None] = None
+    ) -> None:
+        super().__init__(
+            session_id=session_id,
+            type=type,
+            content=content,
+            timestamp=timestamp,
+            msg_id=msg_id
+        )
+        # Whether the command is executed in an interactive mode.
+        self.interactive = interactive
     
     @property
-    def cmd_content(self) -> str:
-        return self.content
+    def cmd_content(self) -> Union[str, None]:
+        if (
+            self.content is None or 
+            'cmd' not in self.content
+        ):
+            return None
+        return self.content['cmd']
     
     @property
     def cmd_id(self) -> str:

@@ -24,7 +24,8 @@ from slime_core.utils.typing import (
     Callable,
     Any,
     Nothing,
-    IO
+    IO,
+    Tuple
 )
 from file_comm.utils.comm import (
     Connection,
@@ -37,10 +38,6 @@ from file_comm.utils.comm import (
     MessageHandler,
     OutputFileHandler
 )
-from file_comm.utils.file import (
-    remove_file_with_retry,
-    remove_dir_with_retry
-)
 from file_comm.utils.parallel import (
     CommandPool,
     LifecycleRun,
@@ -49,12 +46,13 @@ from file_comm.utils.parallel import (
 from file_comm.utils import (
     polling,
     config,
-    timestamp_to_str
+    timestamp_to_str,
+    StreamBytesParser
 )
 from file_comm.utils.exception import ServerShutdown
 from file_comm.utils.logging import logger
 from file_comm.utils.system import send_keyboard_interrupt
-from . import ServerInfo, SessionInfo, dispatch_action, ActionFunc
+from . import ServerInfo, SessionInfo, dispatch_action, ActionFunc, param_check
 
 
 class SessionState(ReadonlyAttr):
@@ -182,7 +180,8 @@ class Server(
                     'Main Server'
                 )
                 if action is not MISSING:
-                    action(self, msg)
+                    res = action(self, msg)
+                    self.check_action_result(res)
             except ServerShutdown:
                 return
     
@@ -230,8 +229,9 @@ class Server(
         session.start()
     
     @action_registry(key='destroy_session')
+    @param_check(required=('session_id',))
     def destroy_session(self, msg: Message):
-        session_id = msg.content or msg.session_id
+        session_id = msg.content['session_id']
         if session_id not in self.session_dict:
             logger.warning(
                 f'Session id {session_id} not in the session dict.'
@@ -250,6 +250,13 @@ class Server(
     
     def pop_session_dict(self, session_id: str):
         return self.session_dict.pop(session_id, None)
+    
+    def check_action_result(self, res: Union[None, Tuple[str, ...]]):
+        if res is None: pass
+        elif isinstance(res, tuple):
+            logger.warning(
+                f'Missing args: {res}'
+            )
 
 
 class Session(
@@ -320,6 +327,18 @@ class Session(
         return self.connect()
     
     def running(self):
+        # Send the server version.
+        self.client_writer.write(
+            Message(
+                session_id=self.session_id,
+                type='server_version',
+                content={
+                    'version': list(config.version)
+                }
+            )
+        )
+        
+        # Start the session listening.
         to_be_destroyed = False
         session_id = self.session_id
         action_registry = self.action_registry
@@ -339,7 +358,8 @@ class Session(
                 f'Server Session {session_id}'
             )
             if action is not MISSING:
-                action(self, msg)
+                res = action(self, msg)
+                self.check_action_result(res)
     
     def after_running(self, *args):
         # Further confirm the command is terminated.
@@ -351,71 +371,121 @@ class Session(
     #
     
     @action_registry(key='cmd')
+    @param_check(required=('cmd', 'encoding', 'stdin', 'exec'))
     def run_new_cmd(self, msg: Message):
         def terminate_command_func(*args):
             self.cmd_pool.cancel(cmd)
             self.reset_running_cmd()
         
         cmd = ShellCommand(
-            self,
-            msg,
+            session=self,
+            msg=msg,
             exit_callbacks=[terminate_command_func]
         )
         self.set_running_cmd(cmd)
         self.cmd_pool.submit(cmd)
     
     @action_registry(key='inner_cmd')
+    @param_check(required=('cmd',))
     def run_inner_cmd(self, msg: Message):
         def terminate_command_func(*args):
             self.reset_running_cmd()
         
         cmd = InnerCommand(
-            self,
-            msg,
+            session=self,
+            msg=msg,
             exit_callbacks=[terminate_command_func]
         )
         self.set_running_cmd(cmd)
         cmd.start()
     
     @action_registry(key='terminate_cmd')
+    @param_check(required=('cmd_id',))
     def terminate_cmd(self, msg: Message):
-        cmd_id = msg.content
+        cmd_id = msg.content['cmd_id']
         with self.running_cmd_lock:
-            running_cmd = self.running_cmd
+            running_cmd = self.running_cmd_check(cmd_id)
             if not running_cmd:
                 return
-            
-            if running_cmd.cmd_id == cmd_id:
-                self.safely_terminate_cmd(cause='remote')
-            else:
-                self.notify_cmd_inconsistency(running_cmd, cmd_id)
+            self.safely_terminate_cmd(cause='remote')
     
     @action_registry(key='force_kill_cmd')
+    @param_check(required=('cmd_id',))
     def force_kill_cmd(self, msg: Message):
-        cmd_id = msg.content
+        cmd_id = msg.content['cmd_id']
         with self.running_cmd_lock:
-            running_cmd = self.running_cmd
+            running_cmd = self.running_cmd_check(cmd_id)
             if not running_cmd:
                 return
-            
-            if running_cmd.cmd_id == cmd_id:
-                self.safely_terminate_cmd(cause='force')
-            else:
-                self.notify_cmd_inconsistency(running_cmd, cmd_id)
+            self.safely_terminate_cmd(cause='force')
     
     @action_registry(key='background_cmd')
+    @param_check(required=('cmd_id',))
     def make_cmd_background(self, msg: Message):
-        cmd_id = msg.content
+        cmd_id = msg.content['cmd_id']
         with self.running_cmd_lock:
-            running_cmd = self.running_cmd
+            running_cmd = self.running_cmd_check(cmd_id)
             if not running_cmd:
-                return
-            
-            if running_cmd.cmd_id != cmd_id:
-                self.notify_cmd_inconsistency(running_cmd, cmd_id)
                 return
             self.background_cmds.append(running_cmd)
             self.reset_running_cmd()
+    
+    @action_registry(key='cmd_input')
+    @param_check(required=('cmd_id', 'input_str'))
+    def input_to_cmd(self, msg: Message):
+        cmd_id = msg.content['cmd_id']
+        input_str = msg.content['input_str']
+        
+        with self.running_cmd_lock:
+            running_cmd = self.running_cmd_check(cmd_id)
+            if not running_cmd:
+                return
+            
+            stdin = running_cmd.stdin
+            if not stdin.writable():
+                self.client_writer.write(
+                    Message(
+                        session_id=self.session_id,
+                        type='info',
+                        content={
+                            'info': (
+                                f'Current cmd {str(running_cmd)} '
+                                'does not accept input.'
+                            )
+                        }
+                    )
+                )
+                return
+            # Write to the cmd.
+            res = stdin.write(f'{input_str}\n')
+            if not res:
+                self.client_writer.write(
+                    Message(
+                        session_id=self.session_id,
+                        type='info',
+                        content={
+                            'info': (
+                                f'Interactive input failed: "{input_str}".'
+                            )
+                        }
+                    )
+                )
+    
+    def running_cmd_check(self, cmd_id: str) -> Union["Command", Literal[False]]:
+        """
+        Check if the msg command id is equal to that of 
+        the running command.
+        """
+        with self.running_cmd_lock:
+            running_cmd = self.running_cmd
+            if not running_cmd:
+                return False
+            
+            if running_cmd.cmd_id != cmd_id:
+                self.notify_cmd_inconsistency(running_cmd, cmd_id)
+                return False
+            
+            return running_cmd
     
     def notify_cmd_inconsistency(
         self,
@@ -429,11 +499,13 @@ class Session(
             Message(
                 session_id=self.session_id,
                 type='info',
-                content=(
-                    f'Command running inconsistency occurred. '
-                    f'Requiring from client: {incoming_cmd_id}. Actual running: '
-                    f'{running_cmd.cmd_id}'
-                )
+                content={
+                    'info': (
+                        f'Command running inconsistency occurred. '
+                        f'Requiring from client: {incoming_cmd_id}. Actual running: '
+                        f'{running_cmd.cmd_id}'
+                    )
+                }
             )
         )
     
@@ -499,11 +571,13 @@ class Session(
                     Message(
                         session_id=self.session_id,
                         type='info',
-                        content=(
-                            'Another command is running or has not been '
-                            'terminated, inconsistency occurred and the '
-                            'incoming command will be ignored.'
-                        )
+                        content={
+                            'info': (
+                                'Another command is running or has not been '
+                                'terminated, inconsistency occurred and the '
+                                'incoming command will be ignored.'
+                            )
+                        }
                     )
                 )
                 return False
@@ -603,6 +677,22 @@ class Session(
             f'Session(session_id="{self.session_id}", '
             f'created_time={timestamp_to_str(self.created_timestamp)})'
         )
+    
+    def check_action_result(self, res: Union[None, Tuple[str, ...]]):
+        if res is None: pass
+        elif isinstance(res, tuple):
+            logger.warning(
+                f'Missing args: {res}'
+            )
+            self.client_writer.write(
+                Message(
+                    session_id=self.session_id,
+                    type='info',
+                    content={
+                        'info': f'Server action missing args: {res}'
+                    }
+                )
+            )
 
 
 class Command(
@@ -631,6 +721,7 @@ class Command(
         self.process: Union[Popen, Nothing] = NOTHING
         self.cmd_state = CommandState()
         self.output_writer = OutputFileHandler(self.output_namespace)
+        self.stdin = default_popen_writer
     
     @property
     def session_info(self) -> SessionInfo:
@@ -675,7 +766,7 @@ class Command(
                 Message(
                     session_id=session_info.session_id,
                     type='cmd_terminated',
-                    content=self.cmd_id
+                    content={'cmd_id': self.cmd_id}
                 )
             )
         elif cmd_state.finished.is_set():
@@ -683,7 +774,7 @@ class Command(
                 Message(
                     session_id=session_info.session_id,
                     type='cmd_finished',
-                    content=self.cmd_id
+                    content={'cmd_id': self.cmd_id}
                 )
             )
         elif cmd_state.terminate_disconnect.is_set():
@@ -700,18 +791,20 @@ class Command(
                 Message(
                     session_id=self.session_info.session_id,
                     type='info',
-                    content=(
-                        f'Command terminated with exception: {str(__exc_type)} - '
-                        f'{str(__exc_value)}. Command content: {self.msg.content}. '
-                        f'Command id: {self.cmd_id}.'
-                    )
+                    content={
+                        'info': (
+                            f'Command terminated with exception: {str(__exc_type)} - '
+                            f'{str(__exc_value)}. Command content: {self.msg.content}. '
+                            f'Command id: {self.cmd_id}.'
+                        )
+                    }
                 )
             )
             self.client_writer.write(
                 Message(
                     session_id=self.session_info.session_id,
                     type='cmd_terminated',
-                    content=self.cmd_id
+                    content={'cmd_id': self.cmd_id}
                 )
             )
         # Mark the command exits.
@@ -731,7 +824,9 @@ class Command(
                 Message(
                     session_id=self.session_info.session_id,
                     type='info',
-                    content=f'Command {self.msg.cmd_id} running...'
+                    content={
+                        'info': f'Command {self.msg.cmd_id} running...'
+                    }
                 )
             )
     
@@ -744,7 +839,9 @@ class Command(
                 Message(
                     session_id=self.session_info.session_id,
                     type='info',
-                    content=f'Command {self.msg.cmd_id} being queued...'
+                    content={
+                        'info': f'Command {self.msg.cmd_id} being queued...'
+                    }
                 )
             )
     
@@ -754,34 +851,63 @@ class Command(
     
     def to_str(self) -> str:
         return (
-            f'Command(cmd="{self.msg.content}", cmd_id="{self.msg.cmd_id}", '
+            f'Command(cmd="{self.msg.content["cmd"]}", cmd_id="{self.msg.cmd_id}", '
             f'session_id="{self.session_info.session_id}", '
             f'created_time={timestamp_to_str(self.msg.timestamp)}, '
             f'pid={str(self.process.pid)})'
         )
+    
+    def __bool__(self) -> bool:
+        return True
 
 
 class ShellCommand(Command):
     
+    readonly_attr__ = (
+        'encoding',
+        'exec'
+    )
+    
+    def __init__(
+        self,
+        session: Session,
+        msg: Message,
+        exit_callbacks: Union[Iterable[ExitCallbackFunc], None] = None
+    ):
+        Command.__init__(self, session, msg, exit_callbacks)
+        content: dict = msg.content
+        encoding: Union[str, None] = content['encoding']
+        stdin: Union[str, None] = content['stdin']
+        exec: Union[str, None] = content['exec']
+        
+        self.encoding = encoding or config.cmd_pipe_encoding
+        if stdin:
+            self.stdin = popen_writer_registry.get(stdin, PopenWriter)(encoding=self.encoding)
+        self.exec = exec or config.cmd_executable
+    
     def running(self) -> None:
         msg = self.msg
+        content = msg.content
         state = self.cmd_state
         process = Popen(
-            msg.content,
+            content['cmd'],
             shell=True,
+            stdin=self.stdin.get_popen_stdin(),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            text=True,
-            encoding=config.cmd_pipe_encoding,
-            executable=config.cmd_executable
+            executable=self.exec,
+            bufsize=0
         )
-        reader = PipeReader(
-            process.stdout,
-            config.cmd_pipe_read_timeout
-        )
-        
         # Set process.
         self.process = process
+        self.stdin.process = process
+        # Init reader.
+        reader = PipeReader(
+            stdout=process.stdout,
+            timeout=config.cmd_pipe_read_timeout,
+            encoding=self.encoding
+        )
+        
         for _ in polling(config.cmd_polling_interval):
             # NOTE: DO NOT return after the signal is sent, 
             # and it should always wait until the process 
@@ -816,6 +942,10 @@ class ShellCommand(Command):
         if not state.pending_terminate:
             # Normally finished.
             state.finished.set()
+    
+    def after_running(self, __exc_type=None, __exc_value=None, __traceback=None):
+        self.stdin.close()
+        return super().after_running(__exc_type, __exc_value, __traceback)
 
 
 class InnerCommand(Command):
@@ -824,11 +954,12 @@ class InnerCommand(Command):
     
     def running(self):
         msg = self.msg
-        inner_cmd = msg.content
+        content = msg.content
+        cmd = content['cmd']
         action = dispatch_action(
             self.inner_cmd_registry,
-            inner_cmd,
-            f'Session inner command: {inner_cmd}. Session id: {self.session_info.session_id}'
+            cmd,
+            f'Session inner command: {cmd}. Session id: {self.session_info.session_id}'
         )
         if action is not MISSING:
             action(self)
@@ -931,6 +1062,9 @@ class BackgroundCommandList(
         self.update_command_states__()
         return self
 
+#
+# Process input / output.
+#
 
 class PipeReader(ReadonlyAttr):
     """
@@ -939,19 +1073,24 @@ class PipeReader(ReadonlyAttr):
     readonly_attr__ = (
         'stdout',
         'selector',
-        'timeout'
+        'timeout',
+        'encoding',
+        'bytes_parser'
     )
     
     def __init__(
         self,
-        stdout: IO,
-        timeout: float
+        stdout: IO[bytes],
+        timeout: float,
+        encoding: str = 'utf-8'
     ) -> None:
         self.stdout = stdout
         # NOTE: Use ``selector`` to get non-blocking outputs.
         self.selector = selectors.DefaultSelector()
         self.selector.register(stdout, selectors.EVENT_READ)
         self.timeout = timeout
+        self.encoding = encoding
+        self.bytes_parser = StreamBytesParser(encoding=self.encoding)
     
     def read(self) -> str:
         """
@@ -978,7 +1117,9 @@ class PipeReader(ReadonlyAttr):
         for key, _ in self.selector.select(0):
             if key.fileobj == self.stdout:
                 # If ready, read all and return.
-                return str(self.stdout.read())
+                return str(
+                    self.bytes_parser.parse(self.stdout.read())
+                )
         # If not ready, directly return empty str.
         return ''
     
@@ -990,6 +1131,114 @@ class PipeReader(ReadonlyAttr):
         for key, _ in self.selector.select(0):
             if key.fileobj == self.stdout:
                 # If ready, read one char and return.
-                return str(self.stdout.read(1))
+                return str(
+                    self.bytes_parser.parse(self.stdout.read(1))
+                )
         # If no output, directly return empty str.
         return ''
+
+
+class PopenWriter(ReadonlyAttr):
+    readonly_attr__ = ('encoding',)
+    
+    def __init__(
+        self,
+        encoding: Union[str, None] = None
+    ) -> None:
+        self.encoding = encoding or config.cmd_pipe_encoding
+        self.process: Union[Popen, Nothing] = NOTHING
+
+    def write(self, content: str) -> bool:
+        return False
+    
+    def writable(self) -> bool:
+        return False
+    
+    def get_popen_stdin(self):
+        """
+        Get the stdin argument passed to ``Popen``.
+        """
+        return None
+    
+    def close(self):
+        """
+        Close the stdin.
+        """
+        pass
+
+
+default_popen_writer = PopenWriter()
+popen_writer_registry = Registry[PopenWriter]('popen_writer_registry')
+
+
+@popen_writer_registry(key='pipe')
+class PipeWriter(PopenWriter):
+    
+    def write(self, content: str) -> bool:
+        if not self.process.stdin:
+            logger.warning(
+                'Popen stdin or its pipe is NoneOrNothing.'
+            )
+            return False
+        
+        try:
+            self.process.stdin.write(
+                content.encode(self.encoding)
+            )
+            self.process.stdin.flush()
+        except Exception as e:
+            logger.error(str(e))
+            return False
+        else:
+            return True
+    
+    def writable(self) -> bool:
+        return True
+    
+    def get_popen_stdin(self):
+        return subprocess.PIPE
+
+
+@popen_writer_registry(key='pty')
+class PtyWriter(PopenWriter):
+    readonly_attr__ = (
+        'master',
+        'slave'
+    )
+    
+    def __init__(
+        self,
+        encoding: Union[str, None] = None
+    ) -> None:
+        super().__init__(encoding)
+        import pty
+        self.master, self.slave = pty.openpty()
+    
+    def write(self, content: str) -> bool:
+        try:
+            os.write(
+                self.master,
+                f'{content}'.encode(self.encoding)
+            )
+        except Exception as e:
+            logger.error(str(e))
+            return False
+        else:
+            return True
+    
+    def writable(self) -> bool:
+        return True
+    
+    def get_popen_stdin(self):
+        return self.slave
+    
+    def close(self):
+        try:
+            os.close(self.master)
+        except Exception as e:
+            logger.error(str(e))
+        
+        try:
+            os.close(self.slave)
+        except Exception as e:
+            logger.error(str(e))

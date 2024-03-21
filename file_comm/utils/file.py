@@ -4,7 +4,7 @@ File operations.
 import os
 import shutil
 from contextlib import contextmanager, suppress
-from . import retry_deco
+from .exception import retry_deco
 
 
 @retry_deco(suppress_exc=Exception)

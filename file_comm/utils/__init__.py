@@ -1,20 +1,12 @@
 import os
 import time
-from functools import partial
-from slime_core.utils.base import BaseList
+from slime_core.utils.metabase import ReadonlyAttr
 from slime_core.utils.typing import (
     MISSING,
-    Type,
     Union,
-    Missing,
-    Callable,
-    TypeVar,
-    Any
+    Any,
+    Tuple
 )
-from .logging import logger
-
-_T = TypeVar("_T")
-_CallableT = TypeVar("_CallableT", bound=Callable)
 
 
 class Config:
@@ -29,7 +21,7 @@ class Config:
         # and return.
         self.cmd_pipe_read_timeout = 0.01
         # command pipe output encoding method.
-        self.cmd_pipe_encoding: Union[str, None] = None
+        self.cmd_pipe_encoding: str = 'utf-8'
         self.cmd_executable: Union[str, None] = None
         # When ``cmd_force_kill`` is set or client terminated, 
         # read the remaining content util timeout.
@@ -52,9 +44,31 @@ class Config:
         # Heartbeat settings.
         self.heartbeat_interval = 10.0
         self.heartbeat_timeout = 600.0
+        # The version info for compatibility check.
+        self.version: Tuple[int, int, int] = (0, 0, 1)
 
 
 config = Config()
+
+
+def version_check(
+    version: Union[Tuple[int, int, int], None],
+    *,
+    min_version: Union[Tuple[int, int, int], None] = None,
+    max_version: Union[Tuple[int, int, int], None] = None
+) -> bool:
+    """
+    Check whether the server version is compatible with some client
+    APIs.
+    """
+    if version is None:
+        return False
+    
+    version = tuple(version)
+    return (
+        ((not min_version) or version >= tuple(min_version)) and 
+        ((not max_version) or version <= tuple(max_version))
+    )
 
 
 def polling(
@@ -92,77 +106,52 @@ def get_server_name(address: str) -> str:
         return 'remote'
 
 #
-# Exception handling.
+# Stream bytes service.
 #
 
-class ExceptionInfo(BaseList[BaseException]):
+class StreamBytesParser(ReadonlyAttr):
     """
-    Used to check the exception information.
+    Parse bytes stream eagerly.
     """
-    pass
-
-
-def retry(
-    func: Callable[[], _T],
-    suppress_exc: Type[BaseException] = Exception,
-    max_retries: Union[int, Missing] = MISSING,
-    exception_wait_timeout: Union[float, Missing] = MISSING
-) -> Union[_T, ExceptionInfo]:
-    """
-    Try to call the ``func`` and retry.
-    """
-    max_retries = (
-        max_retries if 
-        max_retries is not MISSING else 
-        config.exception_retries
-    )
-    exception_wait_timeout = (
-        exception_wait_timeout if 
-        exception_wait_timeout is not MISSING else 
-        config.exception_wait_timeout
-    )
+    readonly_attr__ = ('encoding',)
     
-    info = ExceptionInfo()
-    attempt = 0
-    while True:
+    def __init__(
+        self,
+        encoding: str = 'utf-8'
+    ) -> None:
+        self.buffer = b''
+        self.encoding = encoding
+    
+    def parse(self, data: bytes) -> str:
+        """
+        Try to parse new data with previous stream buffer.
+        """
+        if self.buffer:
+            data = self.buffer + data
+        
+        parsed = ''
         try:
-            return func()
-        except suppress_exc as e:
-            info.append(e)
-        
-        if attempt >= max_retries:
-            logger.warning(
-                f'Func {str(func)} run {attempt} times, but '
-                'still failed, returning the ExceptionInfo.'
-            )
-            return info
-        
-        attempt += 1
-        logger.warning(
-            f'Exception occurred in {str(func)}, retry after '
-            f'{exception_wait_timeout} seconds. Exception: {str(info)}.'
-        )
-        time.sleep(exception_wait_timeout)
-
-
-def retry_deco(
-    suppress_exc: Type[BaseException] = Exception,
-    max_retries: Union[int, Missing] = MISSING,
-    exception_wait_timeout: Union[float, Missing] = MISSING
-) -> Callable[[_CallableT], _CallableT]:
-    """
-    Decorator version of retry.
-    """
-    def decorator(func: _CallableT) -> _CallableT:
-        def wrapper(*args, **kwds):
-            return retry(
-                partial(func, *args, **kwds),
-                suppress_exc=suppress_exc,
-                max_retries=max_retries,
-                exception_wait_timeout=exception_wait_timeout
-            )
-        return wrapper
-    return decorator
+            parsed = data.decode(encoding=self.encoding)
+        except UnicodeDecodeError as e:
+            if e.start != 0:
+                # Parse the previous right data.
+                parsed = data[:e.start].decode(encoding=self.encoding)
+                self.buffer = data[e.start:]
+            elif e.end != len(data):
+                # This means there is some error in the middle, 
+                # then directly parse the decoded str with error 
+                # replace (to explicitly show that there is an 
+                # error).
+                parsed = data.decode(encoding=self.encoding, errors='replace')
+                self.buffer = b''
+            else:
+                # The total bytes are decoded with error, should wait 
+                # the following bytes.
+                self.buffer = data
+        else:
+            # Successfully decode, clear the buffer.
+            self.buffer = b''
+        return parsed
 
 
 def xor__(__x: Any, __y: Any) -> bool:

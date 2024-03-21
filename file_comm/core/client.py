@@ -1,6 +1,8 @@
 import os
 import sys
 import uuid
+import shlex
+import argparse
 import traceback
 from contextlib import contextmanager
 from threading import Thread, Event, RLock
@@ -12,12 +14,15 @@ from slime_core.utils.metaclass import (
 )
 from slime_core.utils.registry import Registry
 from slime_core.utils.typing import (
+    NOTHING,
     MISSING,
     Union,
     Callable,
     Any,
     Literal,
-    Missing
+    Missing,
+    List,
+    Tuple
 )
 from file_comm.utils.comm import (
     Connection,
@@ -44,13 +49,13 @@ from file_comm.utils import (
     get_server_name
 )
 from file_comm.utils.logging import logger
-from . import SessionInfo, ActionFunc, dispatch_action
+from . import SessionInfo, ActionFunc, dispatch_action, param_check
 
 CLIENT_HELP = """
 NOTE: ``Ctrl+C`` won't start a new line. Use ``Ctrl+C`` and ``enter`` instead.
 Inner command help:
 ``help``: Get the help document.
-``exit``: Shutdown the client, disconnect session (or use ``Ctrl+D`` is also allowed).
+``exit``: Shutdown the client, disconnect session.
 ``sid``: Get the sid of the client.
 ``ls-session``: List all the alive sessions.
 ``ls-cmd``: List all the commands executing or queued.
@@ -173,6 +178,8 @@ class Client(
         self.server_writer = MessageHandler(self.session_info.server_listen_namespace)
         self.session_writer = MessageHandler(self.session_info.session_queue_namespace)
         self.client_listener = MessageHandler(self.session_info.client_queue_namespace)
+        self.server_version: Union[Tuple[int, int, int], None] = None
+        self.version_strict: bool = True
     
     #
     # Running operations.
@@ -197,7 +204,9 @@ class Client(
         address = self.session_info.address
         session_id = self.session_info.session_id
         
-        logger.info(f'Connect with server: {address}. Session id: {session_id}.')
+        logger.info(
+            f'Connect with server: {address}. Session id: {session_id}. Client version: "{config.version}".'
+        )
         print(CLIENT_HELP.strip('\n'))
         
         state = self.state
@@ -222,7 +231,8 @@ class Client(
                         f'Client'
                     )
                     if action is not MISSING:
-                        action(self, msg)
+                        res = action(self, msg)
+                        self.check_action_result(res)
             except KeyboardInterrupt:
                 print(
                     'Keyboard Interrupt. (Use "Ctrl + C" and "enter" '
@@ -240,12 +250,16 @@ class Client(
     #
     
     @client_registry(key='info')
-    def process_info(self, msg: Message):
-        logger.info(f'Info from server: {msg.content}')
+    @param_check(required=('info',))
+    def process_info(self, msg: Message) -> None:
+        content = msg.content
+        logger.info(f'Info from server: {content["info"]}')
     
     @client_registry(key='cmd_finished')
-    def process_cmd_finished(self, msg: Message):
-        cmd_id = msg.content
+    @param_check(required=('cmd_id',))
+    def process_cmd_finished(self, msg: Message) -> None:
+        content = msg.content
+        cmd_id = content['cmd_id']
         if (
             self.cli.current_cmd and 
             cmd_id != self.cli.current_cmd.cmd_id
@@ -256,8 +270,10 @@ class Client(
         self.state.cmd_finished.set()
     
     @client_registry(key='cmd_terminated')
-    def process_cmd_terminated(self, msg: Message):
-        cmd_id = msg.content
+    @param_check(required=('cmd_id',))
+    def process_cmd_terminated(self, msg: Message) -> None:
+        content = msg.content
+        cmd_id = content['cmd_id']
         if (
             self.cli.current_cmd and 
             cmd_id != self.cli.current_cmd.cmd_id
@@ -266,6 +282,20 @@ class Client(
                 f'Cmd inconsistency occurred.'
             )
         self.state.cmd_terminate_remote.set()
+    
+    @client_registry(key='server_version')
+    @param_check(required=('version',))
+    def process_server_version(self, msg: Message) -> None:
+        """
+        Get server version for compatibility check.
+        """
+        content = msg.content
+        version = content['version']
+        
+        try:
+            self.server_version = tuple(version)
+        except Exception as e:
+            logger.error(str(e))
     
     #
     # Connection operations.
@@ -370,6 +400,13 @@ class Client(
             # The final clear operation should be done 
             # here if the server is unable to communicate.
             self.session_info.clear_session()
+    
+    def check_action_result(self, res: Union[None, Tuple[str, ...]]):
+        if res is None: pass
+        elif isinstance(res, tuple):
+            logger.warning(
+                f'Missing args: {res}'
+            )
 
 
 class CLI(
@@ -381,10 +418,12 @@ class CLI(
     readonly_attr__ = (
         'client',
         'current_cmd_lock',
-        'server_name'
+        'server_name',
+        'cmd_parser',
+        'inter_cmd_parser'
     )
     
-    cli_registry = Registry[Callable[[Any, str], Union[CommandMessage, bool]]]('cli_registry')
+    cli_registry = Registry[Callable[[Any, List[str]], Union[CommandMessage, bool]]]('cli_registry')
     
     def __init__(
         self,
@@ -398,6 +437,9 @@ class CLI(
         # the current waiting server cmd.
         self.current_cmd_lock = RLock()
         self.server_name = get_server_name(self.session_info.address)
+        # parsers
+        self.cmd_parser = get_cmd_parser()
+        self.inter_cmd_parser = get_inter_cmd_parser()
     
     @property
     def session_info(self) -> SessionInfo:
@@ -465,9 +507,13 @@ class CLI(
                     if msg:
                         self.wait_session_cmd(msg)
                         self.set_current_cmd(None)
-            except (CLITerminate, EOFError):
+            except CLITerminate:
                 print('CLI exiting...')
                 return
+            except EOFError:
+                # NOTE: Ignore EOFError here to avoid CLI exit by mistake 
+                # in the interactive mode.
+                pass
             except:
                 traceback.print_exc()
     
@@ -487,13 +533,32 @@ class CLI(
         if not cmd:
             return False
         
-        cli_func = self.cli_registry.get(cmd, MISSING)
+        cmd_splits = shlex.split(cmd)
+        cli_func = self.cli_registry.get(cmd_splits[0], MISSING)
         if cli_func is MISSING:
-            return self.send_session_cmd(cmd, type='cmd')
+            try:
+                args = self.cmd_parser.parse_args([])
+            except:
+                return False
+            
+            return self.send_session_cmd(
+                content={
+                    'cmd': cmd,
+                    'encoding': args.encoding,
+                    'stdin': args.stdin,
+                    'exec': args.exec
+                },
+                type='cmd'
+            )
         else:
-            return cli_func(self, cmd)
+            return cli_func(self, cmd_splits)
     
-    def send_session_cmd(self, cmd: str, type: str = 'cmd') -> Union[CommandMessage, bool]:
+    def send_session_cmd(
+        self,
+        content: dict,
+        type: str = 'cmd',
+        interactive: bool = False
+    ) -> Union[CommandMessage, bool]:
         """
         Send the command to the session.
         """
@@ -501,7 +566,8 @@ class CLI(
         msg = CommandMessage(
             session_id=session_info.session_id,
             type=type,
-            content=cmd
+            content=content,
+            interactive=interactive
         )
         self.set_current_cmd(msg)
         res = self.session_writer.write(msg)
@@ -516,6 +582,12 @@ class CLI(
         """
         # Set that the command is running.
         self.state.cmd_running.set()
+        interactive = msg.interactive
+        if interactive:
+            cmd_input = InteractiveInput(self, msg)
+            cmd_input.start()
+        else:
+            cmd_input = NOTHING
         
         output_namespace = self.session_info.message_output_namespace(msg)
         output_reader = OutputFileHandler(output_namespace)
@@ -567,7 +639,7 @@ class CLI(
                     Message(
                         session_id=self.session_info.session_id,
                         type='terminate_cmd',
-                        content=msg.cmd_id
+                        content={'cmd_id': msg.cmd_id}
                     )
                 )
                 remote_terminated = wait_symbol(confirm_fp, config.cmd_terminate_timeout)
@@ -582,7 +654,7 @@ class CLI(
                         Message(
                             session_id=self.session_info.session_id,
                             type='force_kill_cmd',
-                            content=msg.cmd_id
+                            content={'cmd_id': msg.cmd_id}
                         )
                     )
                     remote_terminated = wait_symbol(confirm_fp, config.cmd_force_kill_timeout)
@@ -600,7 +672,7 @@ class CLI(
                         Message(
                             session_id=self.session_info.session_id,
                             type='background_cmd',
-                            content=msg.cmd_id
+                            content={'cmd_id': msg.cmd_id}
                         )
                     )
                 to_be_terminated = True
@@ -608,33 +680,113 @@ class CLI(
         # Remove all files.
         remove_file_with_retry(confirm_fp)
         remove_dir_with_retry(output_namespace)
+        
+        if interactive:
+            if cmd_input.is_alive():
+                logger.info(
+                    'The command has exited, and you need to press '
+                    '``Ctrl+D`` to further quit the interactive mode.'
+                )
+            cmd_input.join()
+    
+    #
+    # Actions.
+    #
     
     @cli_registry(key='exit')
-    def cli_exit(self, cmd: str):
+    def cli_exit(self, cmd_splits: List[str]):
         raise CLITerminate
     
     @cli_registry(key='sid')
-    def cli_sid(self, cmd: str) -> Literal[False]:
+    def cli_sid(self, cmd_splits: List[str]) -> Literal[False]:
         print(
             f'Session id: {self.session_info.session_id}'
         )
         return False
     
     @cli_registry(key='help')
-    def cli_help(self, cmd: str) -> Literal[False]:
+    def cli_help(self, cmd_splits: List[str]) -> Literal[False]:
         print(CLIENT_HELP.strip('\n'))
         return False
+    
+    @cli_registry(key='ls-server-version')
+    def ls_server_version(self, cmd_splits: List[str]) -> Literal[False]:
+        logger.info(
+            f'Server version: {self.client.server_version}'
+        )
+        return False
+    
+    @cli_registry(key='version_strict_on')
+    def version_strict_on(self, cmd_splits: List[str]) -> Literal[False]:
+        self.client.version_strict = True
+        logger.info('Set ``version_strict`` to ``True``.')
+        return False
+    
+    @cli_registry(key='version_strict_off')
+    def version_strict_off(self, cmd_splits: List[str]) -> Literal[False]:
+        self.client.version_strict = False
+        logger.info('Set ``version_strict`` to ``False``.')
+        return False
+    
+    @cli_registry(key='inter')
+    def interactive_cmd(self, cmd_splits: List[str]) -> Union[CommandMessage, bool]:
+        """
+        Open command in an interactive mode.
+        """
+        try:
+            args = self.inter_cmd_parser.parse_args(cmd_splits[1:])
+        except:
+            return False
+        
+        return self.send_session_cmd(
+            content={
+                # NOTE: Not using shlex.join for compatibility 
+                # with Python 3.7
+                'cmd': ' '.join(args.cmd),
+                'encoding': args.encoding,
+                'stdin': args.stdin,
+                'exec': args.exec
+            },
+            type='cmd',
+            interactive=True
+        )
+    
+    @cli_registry(key='cmd')
+    def escape_cmd(self, cmd_splits: List[str]) -> Union[CommandMessage, bool]:
+        try:
+            args = self.cmd_parser.parse_args(cmd_splits[1:])
+        except:
+            return False
+        
+        return self.send_session_cmd(
+            content={
+                # NOTE: Not using shlex.join for compatibility 
+                # with Python 3.7
+                'cmd': ' '.join(args.cmd),
+                'encoding': args.encoding,
+                'stdin': args.stdin,
+                'exec': args.exec
+            },
+            type='cmd',
+            interactive=False
+        )
     
     @cli_registry.register_multi([
         'ls-back',
         'ls-session',
         'ls-cmd'
     ])
-    def inner_cmd(self, cmd: str) -> Union[CommandMessage, bool]:
-        return self.send_session_cmd(cmd, type='inner_cmd')
+    def inner_cmd(self, cmd_splits: List[str]) -> Union[CommandMessage, bool]:
+        return self.send_session_cmd(
+            content={
+                'cmd': cmd_splits[0]
+            },
+            type='inner_cmd',
+            interactive=False
+        )
     
     @cli_registry(key='server_shutdown')
-    def server_shutdown(self, cmd: str) -> Literal[False]:
+    def server_shutdown(self, cmd_splits: List[str]) -> Literal[False]:
         try:
             confirm_key = 'YES'
             res = input(
@@ -658,6 +810,10 @@ class CLI(
             )
         finally:
             return False
+    
+    #
+    # Other methods.
+    #
     
     def redirect_output(
         self,
@@ -693,3 +849,110 @@ class CLI(
         sys.stdout.write(content)
         sys.stdout.flush()
         return True
+
+
+class InteractiveInput(
+    Thread,
+    ReadonlyAttr
+):
+    readonly_attr__ = (
+        'cli',
+        'msg'
+    )
+    
+    def __init__(
+        self,
+        cli: CLI,
+        msg: CommandMessage
+    ) -> None:
+        Thread.__init__(self)
+        ReadonlyAttr.__init__(self)
+        self.cli = cli
+        self.msg = msg
+    
+    @property
+    def cmd_id(self) -> str:
+        return self.msg.cmd_id
+    
+    @property
+    def session_writer(self) -> MessageHandler:
+        return self.cli.session_writer
+    
+    @property
+    def session_id(self) -> str:
+        return self.cli.session_info.session_id
+    
+    def run(self) -> None:
+        logger.info(
+            f'You are in the interactive mode. Use ``Ctrl+C`` to '
+            'terminate the command as usual, and use ``Ctrl+D`` to '
+            'quit the interactive input.'
+        )
+        while True:
+            try:
+                input_str = input()
+                self.session_writer.write(
+                    Message(
+                        session_id=self.session_id,
+                        type='cmd_input',
+                        content={
+                            'cmd_id': self.cmd_id,
+                            'input_str': input_str
+                        }
+                    )
+                )
+            except EOFError:
+                logger.info(
+                    f'Interactive mode quitted.'
+                )
+                return
+            except Exception as e:
+                logger.error(str(e))
+
+#
+# Command parsers.
+#
+
+def _get_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        '--encoding',
+        default=None,
+        type=str,
+        required=False
+    )
+    parser.add_argument(
+        '--exec',
+        default=None,
+        type=str,
+        required=False
+    )
+    parser.add_argument('cmd', nargs='*')
+    return parser
+
+def get_cmd_parser() -> argparse.ArgumentParser:
+    parser = _get_parser()
+    parser.prog = 'cmd'
+    # Set the default to None.
+    parser.add_argument(
+        '--stdin',
+        default=None,
+        type=str,
+        choices=('pipe', 'pty'),
+        required=False
+    )
+    return parser
+
+
+def get_inter_cmd_parser() -> argparse.ArgumentParser:
+    parser = _get_parser()
+    parser.prog = 'inter'
+    # Set the default to 'pipe'.
+    parser.add_argument(
+        '--stdin',
+        default='pipe',
+        type=str,
+        choices=('pipe', 'pty'),
+        required=False
+    )
+    return parser

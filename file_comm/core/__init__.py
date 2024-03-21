@@ -1,4 +1,5 @@
 import os
+from functools import wraps
 from slime_core.utils.metabase import ReadonlyAttr
 from slime_core.utils.registry import Registry
 from slime_core.utils.typing import (
@@ -6,7 +7,9 @@ from slime_core.utils.typing import (
     MISSING,
     Union,
     Callable,
-    Any
+    Any,
+    Tuple,
+    Dict
 )
 from file_comm.utils.comm import Message, CommandMessage, create_symbol
 from file_comm.utils.file import remove_dir_with_retry, remove_file_with_retry
@@ -134,8 +137,11 @@ class SessionInfo(ServerInfo, ReadonlyAttr):
         """
         return self.concat_session_path(f'{msg.cmd_id}.term')
 
+#
+# Action Utils.
+#
 
-ActionFunc = Callable[[Any, Message], None]
+ActionFunc = Callable[[Any, Message], Union[None, Tuple[str, ...]]]
 
 
 def dispatch_action(
@@ -153,3 +159,28 @@ def dispatch_action(
             f'and it is ignored. Supported types: {tuple(registry.keys())}'
         )
     return action
+
+
+def param_check(
+    required: Tuple[str, ...]
+):
+    """
+    Check the required message content params. This function forces 
+    the message content to be a dict.
+    """
+    def decorator(func: ActionFunc) -> ActionFunc:
+        @wraps(func)
+        def wrapper(self, msg: Message) -> Union[None, Tuple[str, ...]]:
+            content: Dict = msg.content
+            if content is None:
+                return required
+            
+            missing_params = tuple(
+                filter(lambda param: param not in content, required)
+            )
+            if len(missing_params) > 0:
+                return missing_params
+            
+            return func(self, msg)
+        return wrapper
+    return decorator
