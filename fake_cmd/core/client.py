@@ -24,7 +24,7 @@ from slime_core.utils.typing import (
     List,
     Tuple
 )
-from file_comm.utils.comm import (
+from fake_cmd.utils.comm import (
     Connection,
     Message,
     wait_symbol,
@@ -35,20 +35,20 @@ from file_comm.utils.comm import (
     MessageHandler,
     OutputFileHandler
 )
-from file_comm.utils.file import (
+from fake_cmd.utils.file import (
     remove_file_with_retry,
     remove_dir_with_retry
 )
-from file_comm.utils.exception import CLITerminate
-from file_comm.utils.parallel import (
+from fake_cmd.utils.exception import CLITerminate
+from fake_cmd.utils.parallel import (
     LifecycleRun
 )
-from file_comm.utils import (
+from fake_cmd.utils import (
     config,
     polling,
     get_server_name
 )
-from file_comm.utils.logging import logger
+from fake_cmd.utils.logging import logger
 from . import SessionInfo, ActionFunc, dispatch_action, param_check
 
 CLIENT_HELP = """

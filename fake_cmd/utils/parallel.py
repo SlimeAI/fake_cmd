@@ -16,7 +16,7 @@ from slime_core.utils.typing import (
 )
 from . import polling, config
 if TYPE_CHECKING:
-    from file_comm.core.server import Command
+    from fake_cmd.core.server import Command
 
 
 ExitCallbackFunc = Callable[

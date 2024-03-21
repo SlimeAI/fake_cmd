@@ -27,7 +27,7 @@ from slime_core.utils.typing import (
     IO,
     Tuple
 )
-from file_comm.utils.comm import (
+from fake_cmd.utils.comm import (
     Connection,
     Message,
     create_symbol,
@@ -38,19 +38,19 @@ from file_comm.utils.comm import (
     MessageHandler,
     OutputFileHandler
 )
-from file_comm.utils.parallel import (
+from fake_cmd.utils.parallel import (
     CommandPool,
     LifecycleRun,
     ExitCallbackFunc
 )
-from file_comm.utils import (
+from fake_cmd.utils import (
     polling,
     config,
     timestamp_to_str,
     StreamBytesParser
 )
-from file_comm.utils.exception import ServerShutdown
-from file_comm.utils.logging import logger
+from fake_cmd.utils.exception import ServerShutdown
+from fake_cmd.utils.logging import logger
 from . import ServerInfo, SessionInfo, dispatch_action, ActionFunc, param_check
 
 

@@ -11,9 +11,9 @@ from slime_core.utils.typing import (
     Tuple,
     Dict
 )
-from file_comm.utils.comm import Message, CommandMessage, create_symbol
-from file_comm.utils.file import remove_dir_with_retry, remove_file_with_retry
-from file_comm.utils.logging import logger
+from fake_cmd.utils.comm import Message, CommandMessage, create_symbol
+from fake_cmd.utils.file import remove_dir_with_retry, remove_file_with_retry
+from fake_cmd.utils.logging import logger
 
 
 class ServerInfo(ReadonlyAttr):

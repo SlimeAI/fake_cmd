@@ -19,4 +19,4 @@ def create_logger(name: str) -> logging.Logger:
     return logger
 
 
-logger = create_logger('file_comm')
+logger = create_logger('fake_cmd')

@@ -1,5 +1,5 @@
 import argparse
-from file_comm.core.server import Server
+from fake_cmd.core.server import Server
 
 
 def get_args():
