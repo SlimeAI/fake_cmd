@@ -16,13 +16,17 @@ class Config:
         # NOTE: The cmd is responsible for content output, 
         # so the polling interval should be short.
         self.cmd_polling_interval = 0.01
+        # In the client, when killing a command, the polling 
+        # interval to check the session command states.
+        self.cmd_killing_polling_interval = 0.1
         # Read the subprocess pipe output within the timeout 
         # and return.
         self.cmd_pipe_read_timeout = 0.01
+        self.cmd_pipe_read_timeout_when_terminate = 0.5
         # command pipe output encoding method.
         self.cmd_pipe_encoding: str = 'utf-8'
         self.cmd_executable: Union[str, None] = None
-        # When ``cmd_force_kill`` is set or client terminated, 
+        # When ``kill_cmd`` is sent or client terminated, 
         # read the remaining content util timeout.
         self.cmd_client_read_timeout = 1.0
         self.cmd_pool_schedule_interval = 0.5
@@ -30,11 +34,6 @@ class Config:
         self.server_shutdown_wait_timeout = 5.0
         # Common symbol wait timeout.
         self.wait_timeout = 10.0
-        # Command terminate wait timeout (used by 
-        # client to decide how long to wait when 
-        # kill a command).
-        self.cmd_terminate_timeout = 5.0
-        self.cmd_force_kill_timeout = 5.0
         # Retries
         self.send_msg_retries: int = 3
         self.msg_confirm_wait_timeout: float = 3.0
@@ -44,7 +43,9 @@ class Config:
         self.heartbeat_interval = 10.0
         self.heartbeat_timeout = 600.0
         # The version info for compatibility check.
-        self.version: Tuple[int, int, int] = (0, 0, 1)
+        self.version: Tuple[int, int, int] = (0, 0, 2)
+        # For system settings.
+        self.platform: str = 'unix'
 
 
 config = Config()

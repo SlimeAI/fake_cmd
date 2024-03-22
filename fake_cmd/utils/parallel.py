@@ -36,6 +36,7 @@ class ExitCallbacks:
         self,
         callbacks: Union[Iterable[ExitCallbackFunc], None] = None
     ) -> None:
+        self.exit_callback_lock__ = RLock()
         self.exit_callbacks__ = BaseList(callbacks)
     
     def run_exit_callbacks__(
@@ -44,27 +45,13 @@ class ExitCallbacks:
         __exc_value: Union[BaseException, None] = None,
         __traceback: Union[TracebackType, None] = None
     ):
-        for callback in self.exit_callbacks__:
-            callback(__exc_type, __exc_value, __traceback)
-
-
-class CommandWatchdog(ExitCallbacks, Thread):
-    """
-    Run ``terminate_func`` after the ``command`` terminates.
-    """
-    def __init__(
-        self,
-        cmd: "Command",
-        exit_callbacks: Union[Iterable[ExitCallbackFunc], None] = None
-    ) -> None:
-        ExitCallbacks.__init__(self, exit_callbacks)
-        Thread.__init__(self)
-        self.cmd = cmd
+        with self.exit_callback_lock__:
+            for callback in self.exit_callbacks__:
+                callback(__exc_type, __exc_value, __traceback)
     
-    def run(self) -> None:
-        self.cmd.start()
-        self.cmd.join()
-        self.run_exit_callbacks__()
+    def add_exit_callback__(self, callback: ExitCallbackFunc) -> None:
+        with self.exit_callback_lock__:
+            self.exit_callbacks__.append(callback)
 
 
 class CommandPool(ReadonlyAttr):
@@ -80,7 +67,7 @@ class CommandPool(ReadonlyAttr):
     ) -> None:
         self.queue: List["Command"] = []
         self.queue_lock = RLock()
-        self.execute: List[CommandWatchdog] = []
+        self.execute: List["Command"] = []
         self.execute_lock = RLock()
         self.max_threads = max_threads or os.cpu_count() or 1
         self.pool_close = Event()
@@ -123,16 +110,13 @@ class CommandPool(ReadonlyAttr):
                     def terminate_func(*args):
                         with self.execute_lock:
                             try:
-                                self.execute.remove(watch)
+                                self.execute.remove(cmd)
                             except ValueError:
                                 pass
                     
-                    watch = CommandWatchdog(
-                        cmd,
-                        exit_callbacks=[terminate_func]
-                    )
-                    self.execute.append(watch)
-                    watch.start()
+                    cmd.add_exit_callback__(terminate_func)
+                    self.execute.append(cmd)
+                    cmd.start()
                     # Using a scheduled lock, it can ensure that when 
                     # other threads check the ``scheduled`` Event, it 
                     # is consistent with the real command running state.
@@ -164,7 +148,7 @@ class CommandPool(ReadonlyAttr):
                 pass
             return True
     
-    def update_and_get_execute(self) -> List["CommandWatchdog"]:
+    def update_and_get_execute(self) -> List["Command"]:
         with self.execute_lock:
             self.execute = list(filter(
                 lambda exec: exec.is_alive(),

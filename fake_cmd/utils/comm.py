@@ -48,7 +48,9 @@ class Message(ReadonlyAttr):
     readonly_attr__ = (
         'session_id',
         'msg_id',
-        'timestamp'
+        'timestamp',
+        'content',
+        'type'
     )
     
     json_attrs = (
@@ -119,16 +121,16 @@ class Message(ReadonlyAttr):
         """
         Transfer to json str.
         """
-        kwds = {k:getattr(self, k, None) for k in self.json_attrs}
-        return json.dumps(kwds)
+        kwargs = {k:getattr(self, k, None) for k in self.json_attrs}
+        return json.dumps(kwargs)
     
     @classmethod
     def from_json(cls, json_str: str):
         """
         Create a message object from json str.
         """
-        kwds: Dict[str, Any] = json.loads(json_str)
-        return cls(**{k:kwds.get(k, None) for k in cls.json_attrs})
+        kwargs: Dict[str, Any] = json.loads(json_str)
+        return cls(**{k:kwargs.get(k, None) for k in cls.json_attrs})
 
     @classmethod
     def clone(cls, msg: "Message"):
@@ -151,8 +153,7 @@ class CommandMessage(Message):
         type: str,
         content: Union[str, dict, list, None] = None,
         timestamp: Union[float, None] = None,
-        msg_id: Union[str, None] = None,
-        interactive: Union[bool, None] = None
+        msg_id: Union[str, None] = None
     ) -> None:
         super().__init__(
             session_id=session_id,
@@ -161,8 +162,6 @@ class CommandMessage(Message):
             timestamp=timestamp,
             msg_id=msg_id
         )
-        # Whether the command is executed in an interactive mode.
-        self.interactive = interactive
     
     @property
     def cmd_content(self) -> Union[str, None]:
@@ -176,6 +175,15 @@ class CommandMessage(Message):
     @property
     def cmd_id(self) -> str:
         return self.msg_id
+
+    @property
+    def interactive(self) -> bool:
+        """
+        Whether the command is executed in an interactive mode.
+        """
+        if not self.content:
+            return False
+        return self.content.get('interactive', False)
 
 #
 # File Handlers.
@@ -342,7 +350,7 @@ class SequenceFileHandler(
         """
         pass
     
-    def check_namespace(self, silent: bool = False) -> bool:
+    def check_namespace(self, silent: bool = True) -> bool:
         """
         Check whether the namespace exists.
         """

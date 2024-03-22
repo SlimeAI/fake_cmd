@@ -85,9 +85,9 @@ def retry_deco(
     """
     def decorator(func: _CallableT) -> _CallableT:
         @wraps(func)
-        def wrapper(*args, **kwds):
+        def wrapper(*args, **kwargs):
             return retry(
-                partial(func, *args, **kwds),
+                partial(func, *args, **kwargs),
                 suppress_exc=suppress_exc,
                 max_retries=max_retries,
                 exception_wait_timeout=exception_wait_timeout

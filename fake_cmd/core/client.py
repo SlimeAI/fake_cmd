@@ -44,6 +44,7 @@ from fake_cmd.utils.exception import CLITerminate
 from fake_cmd.utils.parallel import (
     LifecycleRun
 )
+from fake_cmd.utils.system import platform_open_registry
 from fake_cmd.utils import (
     config,
     polling,
@@ -52,11 +53,18 @@ from fake_cmd.utils import (
 )
 from fake_cmd.utils.logging import logger
 from . import SessionInfo, ActionFunc, dispatch_action, param_check
+from .server import popen_writer_registry
 
-CLIENT_HELP = """
+# Keyboard interrupt count corresponding to different meanings.
+CMD_INTERRUPT = 1
+CMD_TERMINATE = 2
+CMD_KILL = 3
+CMD_BACKGROUND = 4
+
+CLIENT_HELP = f"""
 NOTE: ``Ctrl+C`` won't start a new line. Use ``Ctrl+C`` and ``enter`` instead.
 
-Inner command:
+Inner Commands:
 ``help``: Get the help document.
 ``exit``: Shutdown the client, disconnect session.
 ``sid``: Get the sid of the client.
@@ -68,12 +76,18 @@ Inner command:
 ``version_strict_off``: Set the version strict to False.
 
 Advanced Running:
-``cmd``: Run the command with advanced options (use ``cmd -h`` to get more help).
+``cmd``: Run the command with advanced options. Use ``cmd -h`` to get more help.
 ``inter``: Run the command in the interactive mode. Input is enabled, and if you \
 want to quit, use both ``Ctrl+C`` (to terminate the command) and ``Ctrl+D`` (to \
-quit the interactive input). NOTE: Once you have inputted the ``Ctrl+D``, the \
-interactive mode will quit, and no more input content will be accepted to send \
-to the command (use ``inter -h`` to get more help).
+quit the interactive input). Use ``inter -h`` to get more help.
+
+Killing the Running Command:
+The number of ``Ctrl+C`` you press represents different actions:
+- ({CMD_INTERRUPT}): Send keyboard interrupt to the command.
+- ({CMD_TERMINATE}): Terminate the command.
+- ({CMD_KILL}): Kill the command.
+- (>={CMD_BACKGROUND}): Put the command to the background (and then you can use 
+``ls-back`` to check it, or manually use ``kill`` to kill it).
 
 Danger Zone:
 ``server_shutdown``: Shutdown the whole server. BE CAREFUL TO USE IT!!!
@@ -159,7 +173,7 @@ def cli_action_version_check(
 ):
     def decorator(func: Callable[..., Union[CommandMessage, bool]]):
         @wraps(func)
-        def wrapper(self: "CLI", *args, **kwds) -> Union[CommandMessage, bool]:
+        def wrapper(self: "CLI", *args, **kwargs) -> Union[CommandMessage, bool]:
             if (
                 self.version_strict and 
                 not version_check(
@@ -170,7 +184,7 @@ def cli_action_version_check(
                 )
             ):
                 return False
-            return func(self, *args, **kwds)
+            return func(self, *args, **kwargs)
         return wrapper
     return decorator
 
@@ -294,9 +308,9 @@ class Client(
         content = msg.content
         logger.info(f'Info from server: {content["info"]}')
     
-    @client_registry(key='cmd_finished')
-    @param_check(required=('cmd_id',))
-    def process_cmd_finished(self, msg: Message) -> None:
+    @client_registry(key='cmd_quit')
+    @param_check(required=('cmd_id', 'type'))
+    def cmd_quit(self, msg: Message) -> None:
         content = msg.content
         cmd_id = content['cmd_id']
         if (
@@ -306,21 +320,7 @@ class Client(
             logger.warning(
                 f'Cmd inconsistency occurred.'
             )
-        self.state.cmd_finished.set()
-    
-    @client_registry(key='cmd_terminated')
-    @param_check(required=('cmd_id',))
-    def process_cmd_terminated(self, msg: Message) -> None:
-        content = msg.content
-        cmd_id = content['cmd_id']
-        if (
-            self.cli.current_cmd and 
-            cmd_id != self.cli.current_cmd.cmd_id
-        ):
-            logger.warning(
-                f'Cmd inconsistency occurred.'
-            )
-        self.state.cmd_terminate_remote.set()
+        self.terminate_cmd(cause=content['type'])
     
     @client_registry(key='server_version')
     @param_check(required=('version',))
@@ -426,6 +426,21 @@ class Client(
             self.disconnect(initiator=True)
             return False
         return True
+    
+    #
+    # Command operations.
+    #
+    
+    def terminate_cmd(self, cause: Literal['remote', 'finish']):
+        """
+        Process command terminate messages.
+        """
+        state = self.state
+        state_dict = {
+            'remote': state.cmd_terminate_remote,
+            'finish': state.cmd_finished
+        }
+        state_dict[cause].set()
     
     #
     # Other methods
@@ -556,7 +571,6 @@ class CLI(
                     msg = self.process_cmd(cmd)
                     if msg:
                         self.wait_session_cmd(msg)
-                        self.set_current_cmd(None)
             except CLITerminate:
                 print('CLI exiting...')
                 return
@@ -587,17 +601,16 @@ class CLI(
         cli_func = self.cli_registry.get(cmd_splits[0], MISSING)
         if cli_func is MISSING:
             try:
-                args = self.cmd_parser.parse_args([])
+                # All the cmd_splits will be seen as part of the command.
+                args = self.cmd_parser.parse_args(
+                    ['--'] + cmd_splits
+                )
+                args.interactive = False
             except:
                 return False
             
             return self.send_session_cmd(
-                content={
-                    'cmd': cmd,
-                    'encoding': args.encoding,
-                    'stdin': args.stdin,
-                    'exec': args.exec
-                },
+                content=self._make_cmd_content_through_args(args),
                 type='cmd'
             )
         else:
@@ -610,8 +623,7 @@ class CLI(
     def send_session_cmd(
         self,
         content: dict,
-        type: str = 'cmd',
-        interactive: bool = False
+        type: str = 'cmd'
     ) -> Union[CommandMessage, bool]:
         """
         Send the command to the session.
@@ -620,8 +632,7 @@ class CLI(
         msg = CommandMessage(
             session_id=session_info.session_id,
             type=type,
-            content=content,
-            interactive=interactive
+            content=content
         )
         self.set_current_cmd(msg)
         res = self.session_writer.write(msg)
@@ -634,8 +645,6 @@ class CLI(
         """
         Wait the session command to finish.
         """
-        # Set that the command is running.
-        self.state.cmd_running.set()
         interactive = msg.interactive
         if interactive:
             cmd_input = InteractiveInput(self, msg)
@@ -643,6 +652,29 @@ class CLI(
         else:
             cmd_input = NOTHING
         
+        try:
+            # Set that the command is running.
+            self.state.cmd_running.set()
+            return self._wait_session_cmd(msg)
+        except Exception as e:
+            logger.error(str(e))
+        finally:
+            # Set that the command finished (for the interactive).
+            self.state.cmd_running.clear()
+            if interactive:
+                if cmd_input.is_alive():
+                    logger.info(
+                        'The command has exited, and you need to press '
+                        '``Ctrl+D`` or ``Enter`` to further quit the '
+                        'interactive mode.'
+                    )
+                cmd_input.join()
+            self.set_current_cmd(None)
+
+    def _wait_session_cmd(self, msg: CommandMessage):
+        """
+        Wait the session command to finish (wrapped method).
+        """
         output_namespace = self.session_info.message_output_namespace(msg)
         output_reader = OutputFileHandler(output_namespace)
         confirm_fp = self.session_info.command_terminate_confirm_fp(msg)
@@ -658,22 +690,15 @@ class CLI(
                 self.redirect_output(output_reader, read_all=True)
                 break
             
-            has_output = self.redirect_output(output_reader, read_all=False)
-            if to_be_terminated and not has_output:
-                # No more output, directly break.
-                break
-            
             if (
-                state.terminate.is_set() or 
-                (to_be_terminated and state.get_keyboard_interrupt() > 1)
+                state.terminate.is_set() or to_be_terminated
             ):
                 # ``to_be_terminated``: the client has already request the session 
                 # to terminate the command, no matter what the response is. 
-                # NOTE: If cmd_terminate wait over timeout, the process will be put 
-                # to the background. However, the process may still endlessly produce 
-                # output, causing the cli unable to normally quit, so when keyboard_interrupt
-                # is set more than 1, read all the remaining content within a set 
-                # timeout, and directly break.
+                # NOTE: If keyboard_interrupt >= 4, the process will be put to the 
+                # background. However, the process may still endlessly produce output, 
+                # causing the cli unable to normally quit, so all the remaining content 
+                # should be read within a set timeout, and directly break.
                 self.redirect_output(
                     output_reader,
                     read_all=True,
@@ -681,67 +706,102 @@ class CLI(
                 )
                 break
             
+            # Print the output content to the fake_cmd.
+            self.redirect_output(output_reader, read_all=False)
+            
             if (
                 (not to_be_terminated) and
                 state.get_keyboard_interrupt() > 0
             ):
-                # Terminate from local.
-                logger.info(
-                    f'Terminating session command: {msg.cmd_content}.'
-                )
-                self.session_writer.write(
-                    Message(
-                        session_id=self.session_info.session_id,
-                        type='terminate_cmd',
-                        content={'cmd_id': msg.cmd_id}
-                    )
-                )
-                remote_terminated = wait_symbol(confirm_fp, config.cmd_terminate_timeout)
-                
-                if (
-                    not remote_terminated and 
-                    state.get_keyboard_interrupt() > 1
-                ):
-                    # After terminate local, check force kill.
-                    logger.info('Trying force kill the command...')
-                    self.session_writer.write(
-                        Message(
-                            session_id=self.session_info.session_id,
-                            type='force_kill_cmd',
-                            content={'cmd_id': msg.cmd_id}
-                        )
-                    )
-                    remote_terminated = wait_symbol(confirm_fp, config.cmd_force_kill_timeout)
-                
-                if remote_terminated:
-                    logger.info(
-                        f'Command successfully terminated.'
-                    )
-                else:
-                    logger.warning(
-                        f'Command may take more time to terminate, and '
-                        f'it is now put to the background.'
-                    )
-                    self.session_writer.write(
-                        Message(
-                            session_id=self.session_info.session_id,
-                            type='background_cmd',
-                            content={'cmd_id': msg.cmd_id}
-                        )
-                    )
+                # Set ``to_be_terminated``
                 to_be_terminated = True
+                # flags that indicate whether the corresponding 
+                # kill_cmd messages have been sent (to avoid 
+                # repeated sending).
+                keyboard_interrupt_sent = False
+                terminate_sent = False
+                kill_sent = False
+                # The command content (for logging).
+                cmd_content = msg.cmd_content
+                
+                def send_kill_cmd_msg(type: str):
+                    """
+                    Send the kill_cmd msg with given type.
+                    """
+                    if (
+                        self.version_strict and 
+                        not version_check(
+                            self.server_version,
+                            min_version=(0, 0, 2)
+                        )
+                    ):
+                        return
+                    self.session_writer.write(
+                        Message(
+                            session_id=self.session_info.session_id,
+                            type='kill_cmd',
+                            content={
+                                'cmd_id': msg.cmd_id,
+                                'type': type
+                            }
+                        )
+                    )
+                
+                # Process keyboard interrupts.
+                for _ in polling(config.cmd_killing_polling_interval):
+                    # NOTE: ``keyboard_interrupt_cnt`` should be acquired during 
+                    # each loop to dynamically respond to the user behavior.
+                    keyboard_interrupt_cnt = state.get_keyboard_interrupt()
+                    if keyboard_interrupt_cnt >= CMD_BACKGROUND:
+                        # Put the command to the background.
+                        self.session_writer.write(
+                            Message(
+                                session_id=self.session_info.session_id,
+                                type='background_cmd',
+                                content={'cmd_id': msg.cmd_id}
+                            )
+                        )
+                        logger.info(
+                            'Command is now put to the background, and use '
+                            '``ls-back`` to check its state.'
+                        )
+                        break
+                    elif (
+                        keyboard_interrupt_cnt == CMD_KILL and 
+                        not kill_sent
+                    ):
+                        # Kill the command (send SIGKILL)
+                        logger.info(f'Killing session command: {cmd_content}.')
+                        send_kill_cmd_msg(type='force')
+                        kill_sent = True
+                    elif (
+                        keyboard_interrupt_cnt == CMD_TERMINATE and 
+                        not terminate_sent
+                    ):
+                        # Terminate the command (send SIGTERM)
+                        logger.info(f'Terminating session command: {cmd_content}.')
+                        send_kill_cmd_msg(type='remote')
+                        terminate_sent = True
+                    elif (
+                        keyboard_interrupt_cnt == CMD_INTERRUPT and 
+                        not keyboard_interrupt_sent
+                    ):
+                        # Send keyboard interrupt (send SIGINT)
+                        logger.info(
+                            f'Sending keyboard interrupt to session command: {cmd_content}.'
+                        )
+                        send_kill_cmd_msg(type='keyboard')
+                        keyboard_interrupt_sent = True
+                    
+                    # Keep printing output during killing.
+                    self.redirect_output(output_reader, read_all=False)
+                    if check_symbol(confirm_fp):
+                        logger.info(f'Command successfully terminated.')
+                        break
         
         # Remove all files.
         remove_file_with_retry(confirm_fp)
         remove_dir_with_retry(output_namespace)
-        
-        if interactive:
-            if cmd_input.is_alive():
-                logger.info(
-                    'The command has exited, and you need to press '
-                    '``Ctrl+D`` to further quit the interactive mode.'
-                )
-            cmd_input.join()
     
     #
     # Actions.
@@ -782,49 +842,47 @@ class CLI(
         logger.info('Set ``version_strict`` to ``False``.')
         return False
     
+    def _make_cmd_content_through_args(self, args) -> dict:
+        return {
+            # NOTE: Not using shlex.join for compatibility 
+            # with Python 3.7
+            'cmd': ' '.join(args.cmd),
+            'encoding': args.encoding,
+            'stdin': args.stdin,
+            'exec': args.exec,
+            'platform': args.platform,
+            'interactive': args.interactive
+        }
+    
     @cli_registry(key='inter')
-    @cli_action_version_check(min_version=(0, 0, 1))
+    @cli_action_version_check(min_version=(0, 0, 2))
     def interactive_cmd(self, cmd_splits: List[str]) -> Union[CommandMessage, bool]:
         """
         Open command in an interactive mode.
         """
         try:
             args = self.inter_cmd_parser.parse_args(cmd_splits[1:])
+            args.interactive = True
         except:
             return False
         
         return self.send_session_cmd(
-            content={
-                # NOTE: Not using shlex.join for compatibility 
-                # with Python 3.7
-                'cmd': ' '.join(args.cmd),
-                'encoding': args.encoding,
-                'stdin': args.stdin,
-                'exec': args.exec
-            },
-            type='cmd',
-            interactive=True
+            content=self._make_cmd_content_through_args(args),
+            type='cmd'
         )
     
     @cli_registry(key='cmd')
-    @cli_action_version_check(min_version=(0, 0, 1))
+    @cli_action_version_check(min_version=(0, 0, 2))
     def escape_cmd(self, cmd_splits: List[str]) -> Union[CommandMessage, bool]:
         try:
             args = self.cmd_parser.parse_args(cmd_splits[1:])
+            args.interactive = False
         except:
             return False
         
         return self.send_session_cmd(
-            content={
-                # NOTE: Not using shlex.join for compatibility 
-                # with Python 3.7
-                'cmd': ' '.join(args.cmd),
-                'encoding': args.encoding,
-                'stdin': args.stdin,
-                'exec': args.exec
-            },
-            type='cmd',
-            interactive=False
+            content=self._make_cmd_content_through_args(args),
+            type='cmd'
         )
     
     @cli_registry.register_multi([
@@ -836,10 +894,10 @@ class CLI(
     def inner_cmd(self, cmd_splits: List[str]) -> Union[CommandMessage, bool]:
         return self.send_session_cmd(
             content={
-                'cmd': cmd_splits[0]
+                'cmd': cmd_splits[0],
+                'interactive': False
             },
-            type='inner_cmd',
-            interactive=False
+            type='inner_cmd'
         )
     
     @cli_registry(key='server_shutdown')
@@ -939,6 +997,10 @@ class InteractiveInput(
     def session_id(self) -> str:
         return self.cli.session_info.session_id
     
+    @property
+    def cmd_running(self) -> bool:
+        return self.cli.state.cmd_running.is_set()
+    
     def run(self) -> None:
         logger.info(
             f'You are in the interactive mode. Use ``Ctrl+C`` to '
@@ -948,6 +1010,8 @@ class InteractiveInput(
         while True:
             try:
                 input_str = input()
+                if not self.cmd_running:
+                    raise EOFError
                 self.session_writer.write(
                     Message(
                         session_id=self.session_id,
@@ -959,10 +1023,11 @@ class InteractiveInput(
                     )
                 )
             except EOFError:
-                logger.info(
-                    f'Interactive mode quitted.'
-                )
-                return
+                if not self.cmd_running:
+                    logger.info(
+                        f'Interactive mode quitted.'
+                    )
+                    return
             except Exception as e:
                 logger.error(str(e))
 
@@ -992,8 +1057,30 @@ def _get_parser() -> argparse.ArgumentParser:
             'most of the time (and leave it default).'
         )
     )
+    parser.add_argument(
+        '--platform',
+        default=None,
+        type=str,
+        required=False,
+        help=(
+            'The running platform that decides process operations. '
+            'Should not be specified most of the time (and leave it '
+            'default).'
+        ),
+        choices=platform_open_registry.keys()
+    )
+    # TODO: interrupt can be used commonly rather than kill the command 
+    # in the interactive mode.
+    parser.add_argument(
+        '--interrupt_disabled',
+        action='store_true',
+        help=(
+            'Whether keyboard interrupt is disabled to kill the command.'
+        )
+    )
     parser.add_argument('cmd', nargs='*')
     return parser
+
 
 def get_cmd_parser() -> argparse.ArgumentParser:
     parser = _get_parser()
@@ -1023,7 +1110,7 @@ def get_inter_cmd_parser() -> argparse.ArgumentParser:
         '--stdin',
         default='pipe',
         type=str,
-        choices=('pipe', 'pty'),
+        choices=popen_writer_registry.keys(),
         required=False,
         help=(
             'The interactive input setting. Specify the stdin '
