@@ -16,9 +16,6 @@ class Config:
         # NOTE: The cmd is responsible for content output, 
         # so the polling interval should be short.
         self.cmd_polling_interval = 0.01
-        # In the client, when killing a command, the polling 
-        # interval to check the session command states.
-        self.cmd_killing_polling_interval = 0.1
         # Read the subprocess pipe output within the timeout 
         # and return.
         self.cmd_pipe_read_timeout = 0.01

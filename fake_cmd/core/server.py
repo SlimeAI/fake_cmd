@@ -937,10 +937,11 @@ class ShellCommand(Command):
         terminate_sent = False
         kill_sent = False
         
-        for _ in polling(config.cmd_polling_interval):
-            # NOTE: DO NOT return after the signal is sent, 
-            # and it should always wait until the process 
-            # killed.
+        def _process_kill_signals():
+            """
+            Process the kill signals (SIGINT, SIGTERM, SIGKILL, etc.)
+            """
+            nonlocal kill_sent, terminate_sent, interrupt_sent
             if (
                 state.force_kill.is_set() and 
                 not kill_sent
@@ -965,6 +966,12 @@ class ShellCommand(Command):
                 # Send keyboard interrupt.
                 process.keyboard_interrupt()
                 interrupt_sent = True
+        
+        for _ in polling(config.cmd_polling_interval):
+            # NOTE: DO NOT return after the signal is sent, 
+            # and it should always wait until the process 
+            # quits.
+            _process_kill_signals()
             # Write outputs.
             self.output_writer.write(
                 reader.read(config.cmd_pipe_read_timeout)

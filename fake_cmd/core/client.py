@@ -679,22 +679,39 @@ class CLI(
         output_reader = OutputFileHandler(output_namespace)
         confirm_fp = self.session_info.command_terminate_confirm_fp(msg)
         state = self.state
-        
+        # The command content (for logging).
+        cmd_content = msg.cmd_content
+        # Indicate whether the current command is to be 
+        # terminated (and quit the for loop if True).
         to_be_terminated = False
-        for _ in polling(config.cmd_polling_interval):
-            if (
-                state.cmd_terminate_remote.is_set() or 
-                state.cmd_finished.is_set()
-            ):
+        # flags that indicate whether the corresponding 
+        # kill_cmd messages have been sent (to avoid 
+        # repeated sending).
+        keyboard_interrupt_sent = False
+        terminate_sent = False
+        kill_sent = False
+        
+        #
+        # For loop functions (to make the for loop clear and more 
+        # readable).
+        #
+        def _check_cmd_state() -> bool:
+            """
+            Check command state. Return False if the command is ready 
+            to quit.
+            """
+            if state.cmd_finished.is_set():
                 # Clear the output before terminate.
                 self.redirect_output(output_reader, read_all=True)
-                break
-            
+                return False
             if (
-                state.terminate.is_set() or to_be_terminated
+                state.cmd_terminate_remote.is_set() or 
+                state.terminate.is_set() or 
+                to_be_terminated
             ):
                 # ``to_be_terminated``: the client has already request the session 
-                # to terminate the command, no matter what the response is. 
+                # to terminate the command, no matter what the response is, or the 
+                # session has confirmed that the command has been terminated.
                 # NOTE: If keyboard_interrupt >= 4, the process will be put to the 
                 # background. However, the process may still endlessly produce output, 
                 # causing the cli unable to normally quit, so all the remaining content 
@@ -704,100 +721,93 @@ class CLI(
                     read_all=True,
                     read_all_timeout=config.cmd_client_read_timeout
                 )
-                break
-            
-            # Print the output content to the fake_cmd.
-            self.redirect_output(output_reader, read_all=False)
-            
+                return False
+            return True
+        
+        def _send_kill_cmd_msg(type: str):
+            """
+            Send the kill_cmd msg with given type.
+            """
             if (
-                (not to_be_terminated) and
-                state.get_keyboard_interrupt() > 0
+                self.version_strict and 
+                not version_check(
+                    self.server_version,
+                    min_version=(0, 0, 2)
+                )
             ):
+                return
+            self.session_writer.write(
+                Message(
+                    session_id=self.session_info.session_id,
+                    type='kill_cmd',
+                    content={
+                        'cmd_id': msg.cmd_id,
+                        'type': type
+                    }
+                )
+            )
+        
+        def _process_keyboard_interrupt():
+            """
+            Process the keyboard interrupt.
+            """
+            nonlocal to_be_terminated
+            nonlocal kill_sent, terminate_sent, keyboard_interrupt_sent
+            keyboard_interrupt_cnt = state.get_keyboard_interrupt()
+            if keyboard_interrupt_cnt >= CMD_BACKGROUND:
+                # Put the command to the background.
+                self.session_writer.write(
+                    Message(
+                        session_id=self.session_info.session_id,
+                        type='background_cmd',
+                        content={'cmd_id': msg.cmd_id}
+                    )
+                )
+                logger.info(
+                    'Command is now put to the background, and use '
+                    '``ls-back`` to check its state.'
+                )
                 # Set ``to_be_terminated``
                 to_be_terminated = True
-                # flags that indicate whether the corresponding 
-                # kill_cmd messages have been sent (to avoid 
-                # repeated sending).
-                keyboard_interrupt_sent = False
-                terminate_sent = False
-                kill_sent = False
-                # The command content (for logging).
-                cmd_content = msg.cmd_content
-                
-                def send_kill_cmd_msg(type: str):
-                    """
-                    Send the kill_cmd msg with given type.
-                    """
-                    if (
-                        self.version_strict and 
-                        not version_check(
-                            self.server_version,
-                            min_version=(0, 0, 2)
-                        )
-                    ):
-                        return
-                    self.session_writer.write(
-                        Message(
-                            session_id=self.session_info.session_id,
-                            type='kill_cmd',
-                            content={
-                                'cmd_id': msg.cmd_id,
-                                'type': type
-                            }
-                        )
-                    )
-                
-                # Process keyboard interrupts.
-                for _ in polling(config.cmd_killing_polling_interval):
-                    # NOTE: ``keyboard_interrupt_cnt`` should be acquired during 
-                    # each loop to dynamically respond to the user behavior.
-                    keyboard_interrupt_cnt = state.get_keyboard_interrupt()
-                    if keyboard_interrupt_cnt >= CMD_BACKGROUND:
-                        # Put the command to the background.
-                        self.session_writer.write(
-                            Message(
-                                session_id=self.session_info.session_id,
-                                type='background_cmd',
-                                content={'cmd_id': msg.cmd_id}
-                            )
-                        )
-                        logger.info(
-                            'Command is now put to the background, and use '
-                            '``ls-back`` to check its state.'
-                        )
-                        break
-                    elif (
-                        keyboard_interrupt_cnt == CMD_KILL and 
-                        not kill_sent
-                    ):
-                        # Kill the command (send SIGKILL)
-                        logger.info(f'Killing session command: {cmd_content}.')
-                        send_kill_cmd_msg(type='force')
-                        kill_sent = True
-                    elif (
-                        keyboard_interrupt_cnt == CMD_TERMINATE and 
-                        not terminate_sent
-                    ):
-                        # Terminate the command (send SIGTERM)
-                        logger.info(f'Terminating session command: {cmd_content}.')
-                        send_kill_cmd_msg(type='remote')
-                        terminate_sent = True
-                    elif (
-                        keyboard_interrupt_cnt == CMD_INTERRUPT and 
-                        not keyboard_interrupt_sent
-                    ):
-                        # Send keyboard interrupt (send SIGINT)
-                        logger.info(
-                            f'Sending keyboard interrupt to session command: {cmd_content}.'
-                        )
-                        send_kill_cmd_msg(type='keyboard')
-                        keyboard_interrupt_sent = True
-                    
-                    # Keep printing output during killing.
-                    self.redirect_output(output_reader, read_all=False)
-                    if check_symbol(confirm_fp):
-                        logger.info(f'Command successfully terminated.')
-                        break
+            elif (
+                keyboard_interrupt_cnt == CMD_KILL and 
+                not kill_sent
+            ):
+                # Kill the command (send SIGKILL)
+                logger.info(f'Killing session command: {cmd_content}.')
+                _send_kill_cmd_msg(type='force')
+                kill_sent = True
+            elif (
+                keyboard_interrupt_cnt == CMD_TERMINATE and 
+                not terminate_sent
+            ):
+                # Terminate the command (send SIGTERM)
+                logger.info(f'Terminating session command: {cmd_content}.')
+                _send_kill_cmd_msg(type='remote')
+                terminate_sent = True
+            elif (
+                keyboard_interrupt_cnt == CMD_INTERRUPT and 
+                not keyboard_interrupt_sent
+            ):
+                # Send keyboard interrupt (send SIGINT)
+                logger.info(
+                    f'Sending keyboard interrupt to session command: {cmd_content}.'
+                )
+                _send_kill_cmd_msg(type='keyboard')
+                keyboard_interrupt_sent = True
+        
+        for _ in polling(config.cmd_polling_interval):
+            # Check the command state.
+            if not _check_cmd_state():
+                break
+            # Print the output content to the fake_cmd.
+            self.redirect_output(output_reader, read_all=False)
+            # Process keyboard interrupt.
+            _process_keyboard_interrupt()
+            if check_symbol(confirm_fp):
+                logger.info(f'Command successfully terminated.')
+                # Set ``to_be_terminated``
+                to_be_terminated = True
         
         # Remove all files.
         remove_file_with_retry(confirm_fp)
