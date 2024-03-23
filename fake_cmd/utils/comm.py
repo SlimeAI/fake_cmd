@@ -136,6 +136,14 @@ class Message(ReadonlyAttr):
     def clone(cls, msg: "Message"):
         return cls.from_json(msg.to_json())
 
+    def get_content_item(self, key: str, default: Any):
+        """
+        Get message content item with given key and default value.
+        """
+        if not self.content:
+            return default
+        return self.content.get(key, default)
+
     def __bool__(self) -> bool:
         return True
 
@@ -181,9 +189,14 @@ class CommandMessage(Message):
         """
         Whether the command is executed in an interactive mode.
         """
-        if not self.content:
-            return False
-        return self.content.get('interactive', False)
+        return self.get_content_item('interactive', False)
+    
+    @property
+    def kill_disabled(self) -> bool:
+        """
+        Whether the command is disabled to kill using keyboard interrupt.
+        """
+        return self.get_content_item('kill_disabled', False)
 
 #
 # File Handlers.

@@ -376,7 +376,10 @@ class Session(
     #
     
     @action_registry(key='cmd')
-    @param_check(required=('cmd', 'encoding', 'stdin', 'exec', 'platform'))
+    @param_check(required=(
+        'cmd', 'encoding', 'stdin', 'exec', 
+        'platform', 'kill_disabled', 'interactive'
+    ))
     def run_new_cmd(self, msg: Message):
         def terminate_command_func(*args):
             self.cmd_pool.cancel(cmd)
@@ -555,7 +558,7 @@ class Session(
                 cmd.run_exit_callbacks__()
                 cmd.after_running()
     
-    def set_running_cmd(self, running_cmd: Union["Command", None]) -> bool:
+    def set_running_cmd(self, running_cmd: Union["Command", None]):
         """
         Return whether the set operation succeeded.
         """
@@ -573,16 +576,13 @@ class Session(
                         content={
                             'info': (
                                 'Another command is running or has not been '
-                                'terminated, inconsistency occurred and the '
-                                'incoming command will be ignored.'
+                                'terminated, inconsistency occurred. Use ``ls-cmd`` '
+                                'to check it.'
                             )
                         }
                     )
                 )
-                return False
-            else:
-                self.running_cmd = running_cmd
-                return True
+            self.running_cmd = running_cmd
     
     def reset_running_cmd(self):
         self.set_running_cmd(None)
@@ -910,6 +910,7 @@ class ShellCommand(Command):
     def running(self) -> None:
         msg = self.msg
         content = msg.content
+        kill_disabled = msg.kill_disabled
         state = self.cmd_state
         process = platform_open_registry.get(self.platform, DefaultPopen)(
             popen_params=FuncParams(
@@ -942,7 +943,13 @@ class ShellCommand(Command):
             Process the kill signals (SIGINT, SIGTERM, SIGKILL, etc.)
             """
             nonlocal kill_sent, terminate_sent, interrupt_sent
-            if (
+            if kill_disabled:
+                # Can send keyboard interrupt multiple times according to 
+                # the user behavior.
+                if state.keyboard_interrupt.is_set():
+                    process.keyboard_interrupt()
+                    state.keyboard_interrupt.clear()
+            elif (
                 state.force_kill.is_set() and 
                 not kill_sent
             ):

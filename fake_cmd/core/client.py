@@ -23,7 +23,8 @@ from slime_core.utils.typing import (
     Literal,
     Missing,
     List,
-    Tuple
+    Tuple,
+    Nothing
 )
 from fake_cmd.utils.comm import (
     Connection,
@@ -65,33 +66,38 @@ CMD_BACKGROUND = 4
 CLIENT_HELP = f"""
 NOTE: ``Ctrl+C`` won't start a new line. Use ``Ctrl+C`` and ``enter`` instead.
 
-Inner Commands:
-``help``: Get the help document.
-``exit``: Shutdown the client, disconnect session.
-``sid``: Get the sid of the client.
-``ls-session``: List all the alive sessions.
-``ls-cmd``: List all the commands executing or queued.
-``ls-back``: List the background command of the current session.
-``ls-server-version``: Show the server version (for compatibility check).
-``version_strict_on``: Set the version strict to True.
-``version_strict_off``: Set the version strict to False.
+1. Inner Commands:
+>>> ``help``: Get the help document.
+>>> ``exit``: Shutdown the client, disconnect session.
+>>> ``sid``: Get the sid of the client.
+>>> ``ls-session``: List all the alive sessions.
+>>> ``ls-cmd``: List all the commands executing or queued.
+>>> ``ls-back``: List the background command of the current session.
+>>> ``ls-server-version``: Show the server version (for compatibility check).
+>>> ``version_strict_on``: Set the version strict to True.
+>>> ``version_strict_off``: Set the version strict to False.
 
-Advanced Running:
-``cmd``: Run the command with advanced options. Use ``cmd -h`` to get more help.
-``inter``: Run the command in the interactive mode. Input is enabled, and if you \
+2. Advanced Running:
+>>> ``cmd``: Run the command with advanced options. Use ``cmd -h`` to get more help.
+>>> ``inter``: Run the command in the interactive mode. Input is enabled, and if you \
 want to quit, use both ``Ctrl+C`` (to terminate the command) and ``Ctrl+D`` (to \
 quit the interactive input). Use ``inter -h`` to get more help.
 
-Killing the Running Command:
-The number of ``Ctrl+C`` you press represents different actions:
+3. Killing the Running Command:
+>>> If using common ``cmd`` or ``--kill_disabled`` is not specified in the interactive \
+mode, the number of ``Ctrl+C`` you press represents different actions:
 - ({CMD_INTERRUPT}): Send keyboard interrupt to the command.
 - ({CMD_TERMINATE}): Terminate the command.
 - ({CMD_KILL}): Kill the command.
-- (>={CMD_BACKGROUND}): Put the command to the background (and then you can use 
+- (>={CMD_BACKGROUND}): Put the command to the background (and then you can use \
 ``ls-back`` to check it, or manually use ``kill`` to kill it).
+>>> If ``--kill_disabled`` is specified in the interactive mode, one ``Ctrl+C`` corresponds \
+to one keyboard interrupt sent to the command, and you may need to manually exit the \
+command according to different commands (e.g., use ``exit()`` in the Python interactive \
+mode, and use ``exit`` in the /bin/bash, etc.).
 
-Danger Zone:
-``server_shutdown``: Shutdown the whole server. BE CAREFUL TO USE IT!!!
+4. Danger Zone:
+>>> ``server_shutdown``: Shutdown the whole server. BE CAREFUL TO USE IT!!!
 """
 
 
@@ -288,10 +294,7 @@ class Client(
                         res = action(self, msg)
                         self.check_action_result(res)
             except KeyboardInterrupt:
-                print(
-                    'Keyboard Interrupt. (Use "Ctrl + C" and "enter" '
-                    'to start a new input line)'
-                )
+                print('Keyboard Interrupt (Client).')
                 state.add_keyboard_interrupt()
             except:
                 traceback.print_exc()
@@ -610,7 +613,7 @@ class CLI(
             if args is MISSING:
                 return False
             
-            args.interactive = False
+            set_cmd_args(args)
             return self.send_session_cmd(
                 content=self._make_cmd_content_through_args(args),
                 type='cmd'
@@ -657,7 +660,7 @@ class CLI(
         try:
             # Set that the command is running.
             self.state.cmd_running.set()
-            return self._wait_session_cmd(msg)
+            return self._wait_session_cmd(msg, interactive, cmd_input)
         except Exception as e:
             logger.error(str(e))
         finally:
@@ -673,7 +676,12 @@ class CLI(
                 cmd_input.join()
             self.set_current_cmd(None)
 
-    def _wait_session_cmd(self, msg: CommandMessage):
+    def _wait_session_cmd(
+        self,
+        msg: CommandMessage,
+        interactive: bool,
+        cmd_input: Union["InteractiveInput", Nothing]
+    ):
         """
         Wait the session command to finish (wrapped method).
         """
@@ -683,6 +691,7 @@ class CLI(
         state = self.state
         # The command content (for logging).
         cmd_content = msg.cmd_content
+        kill_disabled = msg.kill_disabled
         # Indicate whether the current command is to be 
         # terminated (and quit the for loop if True).
         to_be_terminated = False
@@ -756,7 +765,20 @@ class CLI(
             nonlocal to_be_terminated
             nonlocal kill_sent, terminate_sent, keyboard_interrupt_sent
             keyboard_interrupt_cnt = state.get_keyboard_interrupt()
-            if keyboard_interrupt_cnt >= CMD_BACKGROUND:
+            if interactive and keyboard_interrupt_cnt > 0:
+                # Set to discard the current input content.
+                cmd_input.keyboard_interrupt.set()
+            
+            if kill_disabled:
+                # All the keyboard interrupts are treated as plain 
+                # signals rather than killing requests.
+                if keyboard_interrupt_cnt > 0:
+                    # Send keyboard interrupt.
+                    _send_kill_cmd_msg(type='keyboard')
+                    # Reset the keyboard interrupt to query more 
+                    # user ``Ctrl+C`` press.
+                    state.reset_keyboard_interrupt()
+            elif keyboard_interrupt_cnt >= CMD_BACKGROUND:
                 # Put the command to the background.
                 self.session_writer.write(
                     Message(
@@ -863,7 +885,8 @@ class CLI(
             'stdin': args.stdin,
             'exec': args.exec,
             'platform': args.platform,
-            'interactive': args.interactive
+            'interactive': args.interactive,
+            'kill_disabled': args.kill_disabled
         }
     
     @cli_registry(key='inter')
@@ -880,7 +903,7 @@ class CLI(
         if args is MISSING:
             return False
         
-        args.interactive = True
+        set_inter_cmd_args(args)
         return self.send_session_cmd(
             content=self._make_cmd_content_through_args(args),
             type='cmd'
@@ -897,7 +920,7 @@ class CLI(
         if args is MISSING:
             return False
         
-        args.interactive = False
+        set_cmd_args(args)
         return self.send_session_cmd(
             content=self._make_cmd_content_through_args(args),
             type='cmd'
@@ -990,7 +1013,8 @@ class InteractiveInput(
 ):
     readonly_attr__ = (
         'cli',
-        'msg'
+        'msg',
+        'keyboard_interrupt'
     )
     
     def __init__(
@@ -1002,6 +1026,9 @@ class InteractiveInput(
         ReadonlyAttr.__init__(self)
         self.cli = cli
         self.msg = msg
+        # Keyboard interrupt event recorded to discard 
+        # the incoming input.
+        self.keyboard_interrupt = Event()
     
     @property
     def cmd_id(self) -> str:
@@ -1030,6 +1057,12 @@ class InteractiveInput(
                 input_str = input()
                 if not self.cmd_running:
                     raise EOFError
+                if self.keyboard_interrupt.is_set():
+                    # Clear to check the next keyboard 
+                    # interrupt event.
+                    self.keyboard_interrupt.clear()
+                    # Ignore the current input.
+                    continue
                 self.session_writer.write(
                     Message(
                         session_id=self.session_id,
@@ -1050,7 +1083,7 @@ class InteractiveInput(
                 logger.error(str(e))
 
 #
-# Command parsers.
+# Command argument parsers.
 #
 
 def _get_parser() -> argparse.ArgumentParser:
@@ -1087,15 +1120,6 @@ def _get_parser() -> argparse.ArgumentParser:
         ),
         choices=platform_open_registry.keys()
     )
-    # TODO: interrupt can be used commonly rather than kill the command 
-    # in the interactive mode.
-    parser.add_argument(
-        '--interrupt_disabled',
-        action='store_true',
-        help=(
-            'Whether keyboard interrupt is disabled to kill the command.'
-        )
-    )
     parser.add_argument('cmd', nargs='*')
     return parser
 
@@ -1103,21 +1127,14 @@ def _get_parser() -> argparse.ArgumentParser:
 def get_cmd_parser() -> argparse.ArgumentParser:
     parser = _get_parser()
     parser.prog = 'cmd'
-    # Set the default to None.
-    parser.add_argument(
-        '--stdin',
-        default=None,
-        type=str,
-        choices=(),
-        required=False,
-        help=(
-            'The interactive input setting. Should never be '
-            'specified in ``cmd``. If you want to start the '
-            'command in an interactive mode, use ``inter`` '
-            'instead.'
-        )
-    )
     return parser
+
+
+def set_cmd_args(args: argparse.Namespace) -> None:
+    # Set other command arguments.
+    args.interactive = False
+    args.kill_disabled = False
+    args.stdin = None
 
 
 def get_inter_cmd_parser() -> argparse.ArgumentParser:
@@ -1135,4 +1152,16 @@ def get_inter_cmd_parser() -> argparse.ArgumentParser:
             'setting of Popen.'
         )
     )
+    parser.add_argument(
+        '--kill_disabled',
+        action='store_true',
+        help=(
+            'Whether keyboard interrupt is disabled to kill the command.'
+        )
+    )
     return parser
+
+
+def set_inter_cmd_args(args: argparse.Namespace) -> None:
+    # Set other interactive command arguments.
+    args.interactive = True
