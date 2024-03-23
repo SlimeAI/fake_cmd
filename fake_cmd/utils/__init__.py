@@ -143,3 +143,14 @@ def parser_parse(
         if strict:
             raise
     return namespace
+
+
+class GreaterThanAnything:
+    """
+    Used for comparison.
+    """
+    def __lt__(self, __value: Any) -> bool: return False
+    def __le__(self, __value: Any) -> bool: return False
+    def __eq__(self, __value: Any) -> bool: return False
+    def __gt__(self, __value: Any) -> bool: return True
+    def __ge__(self, __value: Any) -> bool: return True

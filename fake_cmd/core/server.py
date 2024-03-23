@@ -1033,13 +1033,13 @@ class InnerCommand(Command):
         background_cmds = tuple(self.session.background_cmds.update_and_get())
         if len(background_cmds) == 0:
             output_writer.print(
-                'No background cmds available.'
+                '(No background cmds available)'
             )
             return
-        output_writer.print('Background commands:')
+        output_writer.print('>>> Background commands:')
         for index, cmd in enumerate(background_cmds):
             output_writer.print(
-                f'{index}. {cmd.to_str()}'
+                f'({index}) {cmd.to_str()}'
             )
     
     @inner_cmd_registry(key='ls-session')
@@ -1048,11 +1048,11 @@ class InnerCommand(Command):
         sessions = tuple(self.session.server.session_dict.values())
         if len(sessions) == 0:
             # This may never be executed.
-            output_writer.print('No sessions running.')
+            output_writer.print('(No sessions running)')
             return
-        output_writer.print('Sessions:')
-        for session in sessions:
-            output_writer.print(session.to_str())
+        output_writer.print('>>> Sessions:')
+        for index, session in enumerate(sessions):
+            output_writer.print(f'({index}) {session.to_str()}')
     
     @inner_cmd_registry(key='ls-cmd')
     def list_cmd(self):
@@ -1061,22 +1061,18 @@ class InnerCommand(Command):
         with cmd_pool.queue_lock, cmd_pool.execute_lock:
             # Update the execute.
             cmd_pool.update_and_get_execute()
-            output_writer.print('Executing:')
+            output_writer.print('>>> Executing:')
             if len(cmd_pool.execute) == 0:
-                output_writer.print('No executing.')
+                output_writer.print('(No executing)')
             else:
                 for index, cmd in enumerate(cmd_pool.execute):
-                    output_writer.print(
-                        f'{index}. {cmd.to_str()}'
-                    )
-            output_writer.print('Queued:')
+                    output_writer.print(f'({index}) {cmd.to_str()}')
+            output_writer.print('>>> Queued:')
             if len(cmd_pool.queue) == 0:
-                output_writer.print('No queued.')
+                output_writer.print('(No queued)')
             else:
                 for index, cmd in enumerate(cmd_pool.queue):
-                    output_writer.print(
-                        f'{index}. {cmd.to_str()}'
-                    )
+                    output_writer.print(f'({index}) {cmd.to_str()}')
 
 
 class BackgroundCommandList(

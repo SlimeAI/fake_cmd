@@ -1,7 +1,6 @@
 """
 Parallel utils.
 """
-import os
 from types import TracebackType
 from threading import RLock, Thread, Event
 from abc import ABC, abstractmethod
@@ -15,7 +14,7 @@ from slime_core.utils.typing import (
     Iterable,
     Type
 )
-from . import polling, config
+from . import polling, config, GreaterThanAnything
 if TYPE_CHECKING:
     from fake_cmd.core.server import Command
 
@@ -58,7 +57,9 @@ class CommandPool(ReadonlyAttr):
     
     readonly_attr__ = (
         'queue_lock',
-        'execute_lock'
+        'execute_lock',
+        'pool_close',
+        'polling_thread'
     )
     
     def __init__(
@@ -69,7 +70,7 @@ class CommandPool(ReadonlyAttr):
         self.queue_lock = RLock()
         self.execute: List["Command"] = []
         self.execute_lock = RLock()
-        self.max_threads = max_threads or os.cpu_count() or 1
+        self.max_threads = max_threads or GreaterThanAnything()
         self.pool_close = Event()
         self.polling_thread = Thread(target=self.run)
     
@@ -95,7 +96,7 @@ class CommandPool(ReadonlyAttr):
         with self.queue_lock, self.execute_lock:
             while (
                 self.queue and 
-                len(self.execute) < self.max_threads
+                self.max_threads > len(self.execute)
             ):
                 cmd = self.queue.pop(0)
                 cmd_state = cmd.cmd_state
@@ -132,7 +133,7 @@ class CommandPool(ReadonlyAttr):
         """
         with self.queue_lock, self.execute_lock:
             self.queue.append(cmd)
-            queued = (len(self.queue) + len(self.execute)) > self.max_threads
+            queued = self.max_threads < (len(self.queue) + len(self.execute))
             if queued:
                 cmd.cmd_state.queued.set()
                 cmd.info_queued()

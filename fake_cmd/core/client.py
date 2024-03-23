@@ -629,6 +629,7 @@ class Client(
             logger.warning(
                 f'Server address not found: {address}.'
             )
+            state.connection_failed.set()
             return False
         
         try:
@@ -695,14 +696,12 @@ class Client(
     def cmd_quit(self, msg: Message) -> None:
         content = msg.content
         cmd_id = content['cmd_id']
+        current_cmd = self.cli.current_cmd
         if (
-            self.cli.current_cmd and 
-            cmd_id != self.cli.current_cmd.cmd_id
+            current_cmd and 
+            cmd_id == current_cmd.cmd_id
         ):
-            logger.warning(
-                f'Cmd inconsistency occurred.'
-            )
-        self.terminate_cmd(cause=content['type'])
+            self.terminate_cmd(cause=content['type'])
     
     @client_registry(key='server_version')
     @param_check(required=('version',))

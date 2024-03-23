@@ -6,7 +6,7 @@ from fake_cmd.utils import parser_parse
 def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--address', type=str, required=True)
-    parser.add_argument('--max_cmds', type=int, default=100, required=False)
+    parser.add_argument('--max_cmds', type=int, default=None, required=False)
     return parser_parse(parser)
 
 
