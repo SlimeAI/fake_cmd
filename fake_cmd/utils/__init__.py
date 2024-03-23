@@ -1,7 +1,6 @@
 import os
 import time
-from argparse import ArgumentParser
-from slime_core.utils.base import Base
+from argparse import ArgumentParser, Namespace
 from slime_core.utils.typing import (
     MISSING,
     Union,
@@ -130,16 +129,16 @@ def parser_parse(
     parser: ArgumentParser,
     args: Union[Sequence[str], Missing, None] = MISSING,
     strict: bool = True
-) -> Union[Base, Missing]:
+) -> Union[Namespace, Missing]:
     """
-    Argument parse args with ``Base`` object as namespace.
+    Argument parse args.
     """
     namespace = MISSING
     try:
         if args is MISSING:
-            namespace = parser.parse_args(namespace=Base())
+            namespace = parser.parse_args()
         else:
-            namespace = parser.parse_args(args=args, namespace=Base())
+            namespace = parser.parse_args(args=args)
     except SystemExit:
         if strict:
             raise
