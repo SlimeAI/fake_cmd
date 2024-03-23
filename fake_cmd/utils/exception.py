@@ -1,4 +1,6 @@
 import time
+import signal
+from contextlib import contextmanager
 from functools import partial, wraps
 from slime_core.utils.base import BaseList
 from slime_core.utils.typing import (
@@ -94,3 +96,18 @@ def retry_deco(
             )
         return wrapper
     return decorator
+
+
+@contextmanager
+def ignore_keyboard_interrupt():
+    """
+    Ignoring keyboard interrupt in the block. Can only be used in 
+    the main thread of the main interpreter.
+    """
+    sigint = signal.SIGINT
+    previous = signal.getsignal(sigint)
+    signal.signal(sigint, lambda *args, **kwargs: None)
+    try:
+        yield
+    finally:
+        signal.signal(sigint, previous)

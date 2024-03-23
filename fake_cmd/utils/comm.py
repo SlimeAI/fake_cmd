@@ -75,8 +75,6 @@ class Message(ReadonlyAttr):
     ) -> None:
         """
         - ``session_id``: The connection session id.
-        - ``confirm_namespace``: The confirmation namespace for reliable 
-        information transfer.
         - ``type``: The message type (for different actions).
         - ``content``: The message content.
         - ``timestamp``: Time when the message is created.
@@ -252,7 +250,7 @@ class SequenceFileHandler(
                 try:
                     self.detect_files()
                 except Exception as e:
-                    logger.error(str(e))
+                    logger.error(str(e), stack_info=True)
                     return False
             
             if len(self.fp_queue) == 0:
@@ -329,7 +327,7 @@ class SequenceFileHandler(
             with single_writer_lock(fp), open(fp, 'w') as f:
                 f.write(content)
         except Exception as e:
-            logger.error(str(e))
+            logger.error(str(e), stack_info=True)
             return False
         
         return True
@@ -479,7 +477,7 @@ class MessageHandler(SequenceFileHandler):
             # file is created, the consistency is ensured.
             msg = Message.from_json(content)
         except Exception as e:
-            logger.error(str(e))
+            logger.error(str(e), stack_info=True)
             return False
         # Create a confirmation symbol.
         create_symbol(self.get_fp(msg.confirm_fname))

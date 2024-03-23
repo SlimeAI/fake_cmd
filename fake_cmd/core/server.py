@@ -51,7 +51,7 @@ from fake_cmd.utils import (
     timestamp_to_str
 )
 from fake_cmd.utils.system import PlatformPopen, platform_open_registry, DefaultPopen
-from fake_cmd.utils.exception import ServerShutdown
+from fake_cmd.utils.exception import ServerShutdown, ignore_keyboard_interrupt
 from fake_cmd.utils.logging import logger
 from . import ServerInfo, SessionInfo, dispatch_action, ActionFunc, param_check
 
@@ -191,23 +191,24 @@ class Server(
                 return
     
     def after_running(self, *args):
-        logger.info('Server shutting down...')
-        self.cmd_pool.pool_close.set()
-        # Use a new tuple, because the ``exit_callback`` will pop 
-        # the dict items.
-        sessions = tuple(self.session_dict.values())
-        for session in sessions:
-            session.session_state.destroy_local.set()
-        logger.info('Waiting sessions to destroy...')
-        for session in sessions:
-            session.join(config.server_shutdown_wait_timeout)
-        if any(map(lambda session: session.is_alive(), sessions)):
-            logger.warning(
-                'Warning: there are still sessions undestroyed. Ignoring and shutdown...'
-            )
-        else:
-            logger.info('Successfully shutdown. Bye.')
-        self.server_info.clear_server()
+        with ignore_keyboard_interrupt():
+            logger.info('Server shutting down...')
+            self.cmd_pool.pool_close.set()
+            # Use a new tuple, because the ``exit_callback`` will pop 
+            # the dict items.
+            sessions = tuple(self.session_dict.values())
+            for session in sessions:
+                session.session_state.destroy_local.set()
+            logger.info('Waiting sessions to destroy...')
+            for session in sessions:
+                session.join(config.server_shutdown_wait_timeout)
+            if any(map(lambda session: session.is_alive(), sessions)):
+                logger.warning(
+                    'Warning: there are still sessions undestroyed. Ignoring and shutdown...'
+                )
+            else:
+                logger.info('Successfully shutdown. Bye.')
+            self.server_info.clear_server()
     
     @action_registry(key='new_session')
     def create_new_session(self, msg: Message):
@@ -1244,7 +1245,7 @@ class PipeWriter(PopenWriter):
             )
             self.process.stdin.flush()
         except Exception as e:
-            logger.error(str(e))
+            logger.error(str(e), stack_info=True)
             return False
         else:
             return True
@@ -1278,7 +1279,7 @@ class PtyWriter(PopenWriter):
                 f'{content}'.encode(self.encoding)
             )
         except Exception as e:
-            logger.error(str(e))
+            logger.error(str(e), stack_info=True)
             return False
         else:
             return True
@@ -1293,9 +1294,9 @@ class PtyWriter(PopenWriter):
         try:
             os.close(self.master)
         except Exception as e:
-            logger.error(str(e))
+            logger.error(str(e), stack_info=True)
         
         try:
             os.close(self.slave)
         except Exception as e:
-            logger.error(str(e))
+            logger.error(str(e), stack_info=True)

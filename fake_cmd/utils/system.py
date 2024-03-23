@@ -94,7 +94,7 @@ class DefaultPopen(PlatformPopen):
         # Try to kill the progress.
         try:
             os.kill(self.pid, sig)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             pass
 
 
@@ -123,10 +123,10 @@ class UnixPopen(PlatformPopen):
         # Try to kill both progress and progress group in Unix.
         try:
             os.kill(self.pid, sig)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             pass
         
         try:
             os.killpg(self.pid, sig)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             pass

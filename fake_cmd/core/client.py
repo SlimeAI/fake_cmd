@@ -3,7 +3,6 @@ import sys
 import uuid
 import shlex
 import argparse
-import traceback
 from functools import wraps
 from contextlib import contextmanager
 from threading import Thread, Event, RLock
@@ -24,7 +23,7 @@ from slime_core.utils.typing import (
     Missing,
     List,
     Tuple,
-    Nothing
+    Iterable
 )
 from fake_cmd.utils.comm import (
     Connection,
@@ -41,9 +40,10 @@ from fake_cmd.utils.file import (
     remove_file_with_retry,
     remove_dir_with_retry
 )
-from fake_cmd.utils.exception import CLITerminate
+from fake_cmd.utils.exception import CLITerminate, ignore_keyboard_interrupt
 from fake_cmd.utils.parallel import (
-    LifecycleRun
+    LifecycleRun,
+    ExitCallbackFunc
 )
 from fake_cmd.utils.system import platform_open_registry
 from fake_cmd.utils import (
@@ -106,6 +106,8 @@ class State(ReadonlyAttr):
     Communication items between client and cli.
     """
     readonly_attr__ = (
+        'connected',
+        'connection_failed',
         'cmd_running',
         'cmd_terminate_remote',
         'keyboard_interrupt_lock',
@@ -113,10 +115,14 @@ class State(ReadonlyAttr):
         'cmd_finished',
         'terminate',
         'terminate_lock',
-        'unable_to_communicate'
+        'unable_to_communicate',
+        'cli_exit'
     )
     
     def __init__(self) -> None:
+        # Connection-related states.
+        self.connected = Event()
+        self.connection_failed = Event()
         # Indicator that whether a command is running.
         self.cmd_running = Event()
         # Command terminated from remote.
@@ -137,6 +143,8 @@ class State(ReadonlyAttr):
         # ignoring whether the server has already 
         # finished reading messages.
         self.unable_to_communicate = Event()
+        # Set the cli exit to notify the Client to disconnect.
+        self.cli_exit = Event()
     
     def reset(self) -> None:
         self.cmd_running.clear()
@@ -156,13 +164,13 @@ class State(ReadonlyAttr):
         finally:
             self.reset()
 
-    def add_keyboard_interrupt(self) -> None:
+    def add_keyboard_interrupt(self, cnt: int = 1) -> None:
         with self.keyboard_interrupt_lock:
             if (
                 self.keyboard_interrupt >= self.keyboard_interrupt_max_cnt
             ):
                 return
-            self.keyboard_interrupt += 1
+            self.keyboard_interrupt += cnt
     
     def reset_keyboard_interrupt(self) -> None:
         with self.keyboard_interrupt_lock:
@@ -178,9 +186,9 @@ def cli_action_version_check(
     max_version: Union[Tuple[int, int, int], None] = None,
     verbose: bool = True
 ):
-    def decorator(func: Callable[..., Union[CommandMessage, bool]]):
+    def decorator(func: Callable[..., Union["Command", Literal[False]]]):
         @wraps(func)
-        def wrapper(self: "CLI", *args, **kwargs) -> Union[CommandMessage, bool]:
+        def wrapper(self: "CLI", *args, **kwargs) -> Union["Command", Literal[False]]:
             if (
                 self.version_strict and 
                 not version_check(
@@ -196,8 +204,370 @@ def cli_action_version_check(
     return decorator
 
 
+CLIActionFunc = Callable[[Any, List[str]], Union["Command", Literal[False]]]
+
+
+class CLI(
+    LifecycleRun,
+    ReadonlyAttr,
+    metaclass=Metaclasses(ABCMeta, _ReadonlyAttrMetaclass)
+):
+    """
+    The CLI starts the Client and Command, because only the main 
+    process can capture keyboard interrupts, and it is useful to 
+    interrupt the input() function. In older versions, the Client 
+    is responsible for starting the CLI, and because of the above 
+    reason, now it is reversed.
+    """
+    readonly_attr__ = (
+        'client',
+        'current_cmd_lock',
+        'server_name',
+        'cmd_parser',
+        'inter_cmd_parser'
+    )
+    
+    cli_registry = Registry[CLIActionFunc]('cli_registry')
+    
+    def __init__(
+        self,
+        address: str,
+        id_prefix: Union[str, None] = None
+    ):
+        LifecycleRun.__init__(self)
+        self.client = Client(self, address, id_prefix)
+        self.current_cmd: Union["Command", None] = None
+        # Use a current cmd lock to make it consistent with 
+        # the current waiting server cmd.
+        self.current_cmd_lock = RLock()
+        self.server_name = get_server_name(self.session_info.address)
+        # parsers
+        self.cmd_parser = get_cmd_parser()
+        self.inter_cmd_parser = get_inter_cmd_parser()
+    
+    @property
+    def session_info(self) -> SessionInfo:
+        return self.client.session_info
+    
+    @property
+    def state(self) -> State:
+        return self.client.state
+    
+    @property
+    def input_hint(self) -> str:
+        return f'[fake_cmd {self.server_name}]$ '
+    
+    @property
+    def session_writer(self) -> MessageHandler:
+        return self.client.session_writer
+    
+    @property
+    def server_writer(self) -> MessageHandler:
+        return self.client.server_writer
+    
+    @property
+    def server_version(self) -> Union[Tuple[int, int, int], None]:
+        return self.client.server_version
+    
+    @property
+    def version_strict(self) -> bool:
+        return self.client.version_strict
+    
+    def set_current_cmd(self, cmd: Union["Command", None]) -> None:
+        with self.current_cmd_lock:
+            self.current_cmd = cmd
+    
+    #
+    # Running operations.
+    #
+    
+    def before_running(self) -> bool:
+        state = self.state
+        self.client.start()
+        for _ in polling():
+            if state.connection_failed.is_set():
+                return False
+            elif state.connected.is_set():
+                return True
+    
+    def running(self):
+        state = self.state
+        
+        def safe_check_terminate() -> bool:
+            """
+            Safely check whether to terminate.
+            """
+            # Use double check to make it safe.
+            if state.terminate.is_set():
+                return True
+            with state.terminate_lock:
+                if state.terminate.is_set():
+                    return True
+            return False
+        
+        while True:
+            try:
+                # Command input.
+                with state.reset_ctx():
+                    # The terminate state should be checked before and after the 
+                    # cmd input.
+                    if safe_check_terminate(): return
+                    try:
+                        cmd_str = input(self.input_hint)
+                    except KeyboardInterrupt:
+                        print('Keyboard Interrupt (CLI Input).')
+                        continue
+                    except EOFError:
+                        print('EOF (CLI Input).')
+                        continue
+                    finally:
+                        if safe_check_terminate(): return
+                
+                # Process the command.
+                with state.reset_ctx():
+                    # NOTE: the command has already been sent to the server here.
+                    cmd = self.process_cmd(cmd_str)
+                    if cmd:
+                        self.wait_cmd(cmd)
+            except CLITerminate:
+                print('CLI exiting...')
+                return
+            except KeyboardInterrupt:
+                print('Keyboard Interrupt.')
+            except BaseException as e:
+                logger.error(str(e), stack_info=True)
+    
+    def after_running(self, *args):
+        # Wait the Client to quit.
+        self.state.cli_exit.set()
+        self.client.join()
+    
+    #
+    # Command operations.
+    #
+    
+    def process_cmd(self, cmd: Union[str, None]) -> Union["Command", Literal[False]]:
+        """
+        Process the input cmd. Return a ``Command`` object if the cmd should 
+        be executed in the server and it is successfully received, else return 
+        ``False``.
+        """
+        if not cmd:
+            return False
+        
+        cmd_splits = shlex.split(cmd)
+        cli_func = self.cli_registry.get(cmd_splits[0], MISSING)
+        if cli_func is MISSING:
+            # All the cmd_splits will be seen as part of the command.
+            args = parser_parse(
+                parser=self.cmd_parser,
+                args=(['--'] + cmd_splits),
+                strict=False
+            )
+            if args is MISSING:
+                return False
+            
+            set_cmd_args(args)
+            return self.send_session_cmd(
+                content=self._make_cmd_content_through_args(args),
+                type='cmd'
+            )
+        else:
+            return cli_func(self, cmd_splits)
+    
+    # NOTE: Use version check here. Since (0, 0, 1), the msg 
+    # content is either a dict or None, and str is no longer 
+    # supported.
+    @cli_action_version_check(min_version=(0, 0, 1))
+    def send_session_cmd(
+        self,
+        content: dict,
+        type: str = 'cmd'
+    ) -> Union["Command", Literal[False]]:
+        """
+        Send the command to the session.
+        """
+        session_info = self.session_info
+        msg = CommandMessage(
+            session_id=session_info.session_id,
+            type=type,
+            content=content
+        )
+        
+        def cmd_exit(*args):
+            self.set_current_cmd(None)
+        
+        cmd = Command(cli=self, msg=msg, exit_callbacks=[cmd_exit])
+        self.set_current_cmd(cmd)
+        with ignore_keyboard_interrupt():
+            # NOTE: This process should not be interrupted.
+            res = self.session_writer.write(msg)
+            if not res:
+                self.set_current_cmd(None)
+                return False
+            return cmd
+    
+    def wait_cmd(self, cmd: "Command"):
+        """
+        Wait until the command quit.
+        """
+        with ignore_keyboard_interrupt():
+            # NOTE: The keyboard interrupt should be 
+            # ignored here.
+            state = self.state
+            cmd_input = cmd.cmd_input
+            interactive = cmd.interactive
+            cmd.start()
+        while True:
+            try:
+                if interactive:
+                    # NOTE: Keyboard Interrupt may not be 
+                    # caught in the ``run`` function (because 
+                    # the interrupt may be raised before the 
+                    # try-except clause), so it should be put 
+                    # in the outside try-except clause to keep 
+                    # it safe.
+                    cmd_input.run()
+                cmd.join()
+                break
+            except KeyboardInterrupt:
+                print('Keyboard Interrupt (CLI Command).')
+                state.add_keyboard_interrupt()
+    
+    #
+    # Actions.
+    #
+    
+    @cli_registry(key='exit')
+    def cli_exit(self, cmd_splits: List[str]):
+        raise CLITerminate
+    
+    @cli_registry(key='sid')
+    def cli_sid(self, cmd_splits: List[str]) -> Literal[False]:
+        print(
+            f'Session id: {self.session_info.session_id}'
+        )
+        return False
+    
+    @cli_registry(key='help')
+    def cli_help(self, cmd_splits: List[str]) -> Literal[False]:
+        print(CLIENT_HELP.strip('\n'))
+        return False
+    
+    @cli_registry(key='ls-server-version')
+    def ls_server_version(self, cmd_splits: List[str]) -> Literal[False]:
+        logger.info(
+            f'Server version: {self.server_version}'
+        )
+        return False
+    
+    @cli_registry(key='version_strict_on')
+    def version_strict_on(self, cmd_splits: List[str]) -> Literal[False]:
+        self.client.version_strict = True
+        logger.info('Set ``version_strict`` to ``True``.')
+        return False
+    
+    @cli_registry(key='version_strict_off')
+    def version_strict_off(self, cmd_splits: List[str]) -> Literal[False]:
+        self.client.version_strict = False
+        logger.info('Set ``version_strict`` to ``False``.')
+        return False
+    
+    def _make_cmd_content_through_args(self, args) -> dict:
+        return {
+            # NOTE: Not using shlex.join for compatibility 
+            # with Python 3.7
+            'cmd': ' '.join(args.cmd),
+            'encoding': args.encoding,
+            'stdin': args.stdin,
+            'exec': args.exec,
+            'platform': args.platform,
+            'interactive': args.interactive,
+            'kill_disabled': args.kill_disabled
+        }
+    
+    @cli_registry(key='inter')
+    @cli_action_version_check(min_version=(0, 0, 2))
+    def interactive_cmd(self, cmd_splits: List[str]) -> Union["Command", Literal[False]]:
+        """
+        Open command in an interactive mode.
+        """
+        args = parser_parse(
+            parser=self.inter_cmd_parser,
+            args=cmd_splits[1:],
+            strict=False
+        )
+        if args is MISSING:
+            return False
+        
+        set_inter_cmd_args(args)
+        return self.send_session_cmd(
+            content=self._make_cmd_content_through_args(args),
+            type='cmd'
+        )
+    
+    @cli_registry(key='cmd')
+    @cli_action_version_check(min_version=(0, 0, 2))
+    def escape_cmd(self, cmd_splits: List[str]) -> Union["Command", Literal[False]]:
+        args = parser_parse(
+            parser=self.cmd_parser,
+            args=cmd_splits[1:],
+            strict=False
+        )
+        if args is MISSING:
+            return False
+        
+        set_cmd_args(args)
+        return self.send_session_cmd(
+            content=self._make_cmd_content_through_args(args),
+            type='cmd'
+        )
+    
+    @cli_registry.register_multi([
+        'ls-back',
+        'ls-session',
+        'ls-cmd'
+    ])
+    @cli_action_version_check(min_version=(0, 0, 1))
+    def inner_cmd(self, cmd_splits: List[str]) -> Union["Command", Literal[False]]:
+        return self.send_session_cmd(
+            content={
+                'cmd': cmd_splits[0],
+                'interactive': False
+            },
+            type='inner_cmd'
+        )
+    
+    @cli_registry(key='server_shutdown')
+    def server_shutdown(self, cmd_splits: List[str]) -> Literal[False]:
+        try:
+            confirm_key = 'YES'
+            res = input(
+                'WARNING: You are trying to shutdown the server. '
+                'This behavior will terminate all the running '
+                'commands and destroy all the sessions. Use ``ls-cmd``'
+                'and ``ls-session`` to check them. If you are '
+                f'sure, enter exactly "{confirm_key}", else enter '
+                f'anything else. ("{confirm_key}" / [Anything else]): '
+            )
+            if res != confirm_key:
+                logger.info(
+                    'Server shutdown canceled.'
+                )
+                return False
+            self.server_writer.write(
+                Message(
+                    session_id=self.session_info.session_id,
+                    type='server_shutdown'
+                )
+            )
+        finally:
+            return False
+
+
 class Client(
     LifecycleRun,
+    Thread,
     Connection,
     ReadonlyAttr,
     metaclass=Metaclasses(ABCMeta, _ReadonlyAttrMetaclass)
@@ -216,6 +586,7 @@ class Client(
     
     def __init__(
         self,
+        cli: CLI,
         address: str,
         id_prefix: Union[str, None] = None
     ) -> None:
@@ -224,6 +595,7 @@ class Client(
         ``session_id`` more distinguishable.
         """
         LifecycleRun.__init__(self)
+        Thread.__init__(self)
         # Create a new session id.
         session_id = str(uuid.uuid1())
         if id_prefix:
@@ -234,7 +606,7 @@ class Client(
             self.session_info.heartbeat_session_fp
         )
         self.state = State()
-        self.cli = CLI(self)
+        self.cli = cli
         self.server_writer = MessageHandler(self.session_info.server_listen_namespace)
         self.session_writer = MessageHandler(self.session_info.session_queue_namespace)
         self.client_listener = MessageHandler(self.session_info.client_queue_namespace)
@@ -246,6 +618,7 @@ class Client(
     #
     
     def before_running(self) -> bool:
+        state = self.state
         server_check_fp = self.session_info.server_check_fp
         address = self.session_info.address
         
@@ -258,7 +631,18 @@ class Client(
             )
             return False
         
-        return self.connect()
+        try:
+            res = self.connect()
+        except BaseException as e:
+            logger.error(str(e), stack_info=True)
+            state.connection_failed.set()
+            return False
+        
+        if res:
+            state.connected.set()
+        else:
+            state.connection_failed.set()
+        return res
     
     def running(self):
         address = self.session_info.address
@@ -269,35 +653,29 @@ class Client(
         )
         print(CLIENT_HELP.strip('\n'))
         
-        state = self.state
         to_be_destroyed = False
-        # Start the CLI.
-        self.cli.start()
-        while True:
+        
+        for _ in polling():
             try:
-                for _ in polling():
-                    if not to_be_destroyed:
-                        to_be_destroyed = (not self.check_connection())
-                    
-                    msg = self.client_listener.read_one()
-                    if to_be_destroyed and not msg:
-                        # Directly return.
-                        return
-                    elif not msg:
-                        continue
-                    action = dispatch_action(
-                        self.client_registry,
-                        msg.type,
-                        f'Client'
-                    )
-                    if action is not MISSING:
-                        res = action(self, msg)
-                        self.check_action_result(res)
-            except KeyboardInterrupt:
-                print('Keyboard Interrupt (Client).')
-                state.add_keyboard_interrupt()
-            except:
-                traceback.print_exc()
+                if not to_be_destroyed:
+                    to_be_destroyed = (not self.check_connection())
+                
+                msg = self.client_listener.read_one()
+                if to_be_destroyed and not msg:
+                    # Directly return.
+                    return
+                elif not msg:
+                    continue
+                action = dispatch_action(
+                    self.client_registry,
+                    msg.type,
+                    f'Client'
+                )
+                if action is not MISSING:
+                    res = action(self, msg)
+                    self.check_action_result(res)
+            except BaseException as e:
+                logger.error(str(e), stack_info=True)
     
     def after_running(self, *args):
         self.clear_cache()
@@ -338,7 +716,7 @@ class Client(
         try:
             self.server_version = tuple(version)
         except Exception as e:
-            logger.error(str(e))
+            logger.error(str(e), stack_info=True)
     
     #
     # Connection operations.
@@ -383,9 +761,9 @@ class Client(
             with state.terminate_lock:
                 # Use lock to make it consistent.
                 # Send remaining messages before disconnect.
-                # Add twice to force kill.
-                state.add_keyboard_interrupt()
-                state.add_keyboard_interrupt()
+                # Add 3 times to force kill.
+                state.reset_keyboard_interrupt()
+                state.add_keyboard_interrupt(3)
                 # Send to server to disconnect.
                 create_symbol(disconn_session_fp)
                 if (
@@ -425,7 +803,7 @@ class Client(
             return False
         elif (
             not self.heartbeat.beat() or 
-            not self.cli.is_alive()
+            self.state.cli_exit.is_set()
         ):
             self.disconnect(initiator=True)
             return False
@@ -467,227 +845,76 @@ class Client(
             )
 
 
-CLIActionFunc = Callable[[Any, List[str]], Union[CommandMessage, bool]]
-
-
-class CLI(
+class Command(
     LifecycleRun,
     Thread,
     ReadonlyAttr,
     metaclass=Metaclasses(ABCMeta, _ReadonlyAttrMetaclass)
 ):
     readonly_attr__ = (
-        'client',
-        'current_cmd_lock',
-        'server_name',
-        'cmd_parser',
-        'inter_cmd_parser'
+        'cli',
+        'msg',
+        'cmd_input'
     )
-    
-    cli_registry = Registry[CLIActionFunc]('cli_registry')
     
     def __init__(
         self,
-        client: Client
+        cli: CLI,
+        msg: CommandMessage,
+        exit_callbacks: Union[Iterable[ExitCallbackFunc], None] = None
     ):
-        LifecycleRun.__init__(self)
+        LifecycleRun.__init__(self, exit_callbacks)
         Thread.__init__(self)
-        self.client = client
-        self.current_cmd: Union[CommandMessage, None] = None
-        # Use a current cmd lock to make it consistent with 
-        # the current waiting server cmd.
-        self.current_cmd_lock = RLock()
-        self.server_name = get_server_name(self.session_info.address)
-        # parsers
-        self.cmd_parser = get_cmd_parser()
-        self.inter_cmd_parser = get_inter_cmd_parser()
-    
+        self.cli = cli
+        self.msg = msg
+        if self.interactive:
+            self.cmd_input = InteractiveInput(self)
+        else:
+            self.cmd_input = NOTHING
+
     @property
-    def session_info(self) -> SessionInfo:
-        return self.client.session_info
+    def cmd_id(self) -> str:
+        return self.msg.cmd_id
+
+    @property
+    def interactive(self) -> bool:
+        return self.msg.interactive
     
     @property
     def state(self) -> State:
-        return self.client.state
-    
+        return self.cli.state
+
     @property
-    def input_hint(self) -> str:
-        return f'[fake_cmd {self.server_name}]$ '
+    def session_info(self) -> SessionInfo:
+        return self.cli.session_info
     
     @property
     def session_writer(self) -> MessageHandler:
-        return self.client.session_writer
-    
-    @property
-    def server_writer(self) -> MessageHandler:
-        return self.client.server_writer
-    
-    @property
-    def server_version(self) -> Union[Tuple[int, int, int], None]:
-        return self.client.server_version
+        return self.cli.session_writer
     
     @property
     def version_strict(self) -> bool:
-        return self.client.version_strict
+        return self.cli.version_strict
     
-    def set_current_cmd(self, cmd: Union[CommandMessage, None]) -> None:
-        with self.current_cmd_lock:
-            self.current_cmd = cmd
-    
-    #
-    # Running operations.
-    #
+    @property
+    def server_version(self) -> Union[Tuple[int, int, int], None]:
+        return self.cli.server_version
     
     def before_running(self) -> bool:
+        # Set that the command is running.
+        self.state.cmd_running.set()
         return True
     
     def running(self):
-        state = self.state
-        
-        def safe_check_terminate() -> bool:
-            """
-            Safely check whether to terminate.
-            """
-            # Use double check to make it safe.
-            if state.terminate.is_set():
-                return True
-            with state.terminate_lock:
-                if state.terminate.is_set():
-                    return True
-            return False
-        
-        while True:
-            try:
-                # Command input.
-                with state.reset_ctx():
-                    # The terminate state should be checked before and after the 
-                    # cmd input.
-                    if safe_check_terminate(): return
-                    cmd = input(self.input_hint)
-                    if safe_check_terminate(): return
-                    if state.get_keyboard_interrupt() > 0:
-                        # If keyboard interrupt pressed, directly ignore the cmd.
-                        continue
-                
-                # Process the command.
-                with state.reset_ctx():
-                    # NOTE: the command has already been sent to the server here.
-                    msg = self.process_cmd(cmd)
-                    if msg:
-                        self.wait_session_cmd(msg)
-            except CLITerminate:
-                print('CLI exiting...')
-                return
-            except EOFError:
-                # NOTE: Ignore EOFError here to avoid CLI exit by mistake 
-                # in the interactive mode.
-                pass
-            except:
-                traceback.print_exc()
-    
-    def after_running(self, *args):
-        return
-    
-    #
-    # Command operations.
-    #
-    
-    def process_cmd(self, cmd: Union[str, None]) -> Union[CommandMessage, bool]:
-        """
-        Process the input cmd. Return a ``CommandMessage`` object if the 
-        cmd should be executed in the server and it is successfully received, 
-        else return ``False``.
-        """
-        if not cmd:
-            return False
-        
-        cmd_splits = shlex.split(cmd)
-        cli_func = self.cli_registry.get(cmd_splits[0], MISSING)
-        if cli_func is MISSING:
-            # All the cmd_splits will be seen as part of the command.
-            args = parser_parse(
-                parser=self.cmd_parser,
-                args=(['--'] + cmd_splits),
-                strict=False
-            )
-            if args is MISSING:
-                return False
-            
-            set_cmd_args(args)
-            return self.send_session_cmd(
-                content=self._make_cmd_content_through_args(args),
-                type='cmd'
-            )
-        else:
-            return cli_func(self, cmd_splits)
-    
-    # NOTE: Use version check here. Since (0, 0, 1), the msg 
-    # content is either a dict or None, and str is no longer 
-    # supported.
-    @cli_action_version_check(min_version=(0, 0, 1))
-    def send_session_cmd(
-        self,
-        content: dict,
-        type: str = 'cmd'
-    ) -> Union[CommandMessage, bool]:
-        """
-        Send the command to the session.
-        """
-        session_info = self.session_info
-        msg = CommandMessage(
-            session_id=session_info.session_id,
-            type=type,
-            content=content
-        )
-        self.set_current_cmd(msg)
-        res = self.session_writer.write(msg)
-        if not res:
-            self.set_current_cmd(None)
-            return False
-        return msg
-    
-    def wait_session_cmd(self, msg: CommandMessage):
-        """
-        Wait the session command to finish.
-        """
-        interactive = msg.interactive
-        if interactive:
-            cmd_input = InteractiveInput(self, msg)
-            cmd_input.start()
-        else:
-            cmd_input = NOTHING
-        
-        try:
-            # Set that the command is running.
-            self.state.cmd_running.set()
-            return self._wait_session_cmd(msg, interactive, cmd_input)
-        except Exception as e:
-            logger.error(str(e))
-        finally:
-            # Set that the command finished (for the interactive).
-            self.state.cmd_running.clear()
-            if interactive:
-                if cmd_input.is_alive():
-                    logger.info(
-                        'The command has exited, and you need to press '
-                        '``Ctrl+D`` or ``Enter`` to further quit the '
-                        'interactive mode.'
-                    )
-                cmd_input.join()
-            self.set_current_cmd(None)
-
-    def _wait_session_cmd(
-        self,
-        msg: CommandMessage,
-        interactive: bool,
-        cmd_input: Union["InteractiveInput", Nothing]
-    ):
         """
         Wait the session command to finish (wrapped method).
         """
-        output_namespace = self.session_info.message_output_namespace(msg)
+        msg = self.msg
+        session_info = self.session_info
+        session_writer = self.session_writer
+        output_namespace = session_info.message_output_namespace(msg)
         output_reader = OutputFileHandler(output_namespace)
-        confirm_fp = self.session_info.command_terminate_confirm_fp(msg)
+        confirm_fp = session_info.command_terminate_confirm_fp(msg)
         state = self.state
         # The command content (for logging).
         cmd_content = msg.cmd_content
@@ -747,9 +974,9 @@ class CLI(
                 )
             ):
                 return
-            self.session_writer.write(
+            session_writer.write(
                 Message(
-                    session_id=self.session_info.session_id,
+                    session_id=session_info.session_id,
                     type='kill_cmd',
                     content={
                         'cmd_id': msg.cmd_id,
@@ -765,9 +992,6 @@ class CLI(
             nonlocal to_be_terminated
             nonlocal kill_sent, terminate_sent, keyboard_interrupt_sent
             keyboard_interrupt_cnt = state.get_keyboard_interrupt()
-            if interactive and keyboard_interrupt_cnt > 0:
-                # Set to discard the current input content.
-                cmd_input.keyboard_interrupt.set()
             
             if kill_disabled:
                 # All the keyboard interrupts are treated as plain 
@@ -780,7 +1004,7 @@ class CLI(
                     state.reset_keyboard_interrupt()
             elif keyboard_interrupt_cnt >= CMD_BACKGROUND:
                 # Put the command to the background.
-                self.session_writer.write(
+                session_writer.write(
                     Message(
                         session_id=self.session_info.session_id,
                         type='background_cmd',
@@ -832,144 +1056,34 @@ class CLI(
                 logger.info(f'Command successfully terminated.')
                 # Set ``to_be_terminated``
                 to_be_terminated = True
+    
+    def after_running(self, __exc_type=None, __exc_value=None, __traceback=None):
+        session_info = self.session_info
+        msg = self.msg
+        confirm_fp = session_info.command_terminate_confirm_fp(msg)
+        output_namespace = session_info.message_output_namespace(msg)
         
+        if (
+            __exc_type is not None or 
+            __exc_value is not None or 
+            __traceback is not None
+        ):
+            logger.error(
+                f'Exception occurred in command. {str(__exc_type)} - {str(__exc_value)}',
+                stack_info=True
+            )
+        # Set that the command finished (for the interactive).
+        self.state.cmd_running.clear()
+        if self.interactive:
+            if not self.cmd_input.quit.is_set():
+                logger.info(
+                    'The command has exited, and you need to press '
+                    '``Ctrl+C`` or ``Enter`` to further quit the '
+                    'interactive mode.'
+                )
         # Remove all files.
         remove_file_with_retry(confirm_fp)
         remove_dir_with_retry(output_namespace)
-    
-    #
-    # Actions.
-    #
-    
-    @cli_registry(key='exit')
-    def cli_exit(self, cmd_splits: List[str]):
-        raise CLITerminate
-    
-    @cli_registry(key='sid')
-    def cli_sid(self, cmd_splits: List[str]) -> Literal[False]:
-        print(
-            f'Session id: {self.session_info.session_id}'
-        )
-        return False
-    
-    @cli_registry(key='help')
-    def cli_help(self, cmd_splits: List[str]) -> Literal[False]:
-        print(CLIENT_HELP.strip('\n'))
-        return False
-    
-    @cli_registry(key='ls-server-version')
-    def ls_server_version(self, cmd_splits: List[str]) -> Literal[False]:
-        logger.info(
-            f'Server version: {self.server_version}'
-        )
-        return False
-    
-    @cli_registry(key='version_strict_on')
-    def version_strict_on(self, cmd_splits: List[str]) -> Literal[False]:
-        self.client.version_strict = True
-        logger.info('Set ``version_strict`` to ``True``.')
-        return False
-    
-    @cli_registry(key='version_strict_off')
-    def version_strict_off(self, cmd_splits: List[str]) -> Literal[False]:
-        self.client.version_strict = False
-        logger.info('Set ``version_strict`` to ``False``.')
-        return False
-    
-    def _make_cmd_content_through_args(self, args) -> dict:
-        return {
-            # NOTE: Not using shlex.join for compatibility 
-            # with Python 3.7
-            'cmd': ' '.join(args.cmd),
-            'encoding': args.encoding,
-            'stdin': args.stdin,
-            'exec': args.exec,
-            'platform': args.platform,
-            'interactive': args.interactive,
-            'kill_disabled': args.kill_disabled
-        }
-    
-    @cli_registry(key='inter')
-    @cli_action_version_check(min_version=(0, 0, 2))
-    def interactive_cmd(self, cmd_splits: List[str]) -> Union[CommandMessage, bool]:
-        """
-        Open command in an interactive mode.
-        """
-        args = parser_parse(
-            parser=self.inter_cmd_parser,
-            args=cmd_splits[1:],
-            strict=False
-        )
-        if args is MISSING:
-            return False
-        
-        set_inter_cmd_args(args)
-        return self.send_session_cmd(
-            content=self._make_cmd_content_through_args(args),
-            type='cmd'
-        )
-    
-    @cli_registry(key='cmd')
-    @cli_action_version_check(min_version=(0, 0, 2))
-    def escape_cmd(self, cmd_splits: List[str]) -> Union[CommandMessage, bool]:
-        args = parser_parse(
-            parser=self.cmd_parser,
-            args=cmd_splits[1:],
-            strict=False
-        )
-        if args is MISSING:
-            return False
-        
-        set_cmd_args(args)
-        return self.send_session_cmd(
-            content=self._make_cmd_content_through_args(args),
-            type='cmd'
-        )
-    
-    @cli_registry.register_multi([
-        'ls-back',
-        'ls-session',
-        'ls-cmd'
-    ])
-    @cli_action_version_check(min_version=(0, 0, 1))
-    def inner_cmd(self, cmd_splits: List[str]) -> Union[CommandMessage, bool]:
-        return self.send_session_cmd(
-            content={
-                'cmd': cmd_splits[0],
-                'interactive': False
-            },
-            type='inner_cmd'
-        )
-    
-    @cli_registry(key='server_shutdown')
-    def server_shutdown(self, cmd_splits: List[str]) -> Literal[False]:
-        try:
-            confirm_key = 'YES'
-            res = input(
-                'WARNING: You are trying to shutdown the server. '
-                'This behavior will terminate all the running '
-                'commands and destroy all the sessions. Use ``ls-cmd``'
-                'and ``ls-session`` to check them. If you are '
-                f'sure, enter exactly "{confirm_key}", else enter '
-                f'anything else. ("{confirm_key}" / [Anything else]): '
-            )
-            if res != confirm_key:
-                logger.info(
-                    'Server shutdown canceled.'
-                )
-                return False
-            self.server_writer.write(
-                Message(
-                    session_id=self.session_info.session_id,
-                    type='server_shutdown'
-                )
-            )
-        finally:
-            return False
-    
-    #
-    # Other methods.
-    #
     
     def redirect_output(
         self,
@@ -1005,30 +1119,30 @@ class CLI(
         sys.stdout.write(content)
         sys.stdout.flush()
         return True
+    
+    def __bool__(self) -> bool:
+        return True
 
 
 class InteractiveInput(
-    Thread,
-    ReadonlyAttr
+    LifecycleRun,
+    ReadonlyAttr,
+    metaclass=Metaclasses(ABCMeta, _ReadonlyAttrMetaclass)
 ):
     readonly_attr__ = (
-        'cli',
-        'msg',
-        'keyboard_interrupt'
+        'cmd',
+        'quit'
     )
     
-    def __init__(
-        self,
-        cli: CLI,
-        msg: CommandMessage
-    ) -> None:
-        Thread.__init__(self)
+    def __init__(self, cmd: Command) -> None:
+        LifecycleRun.__init__(self)
         ReadonlyAttr.__init__(self)
-        self.cli = cli
-        self.msg = msg
-        # Keyboard interrupt event recorded to discard 
-        # the incoming input.
-        self.keyboard_interrupt = Event()
+        self.cmd = cmd
+        self.quit = Event()
+    
+    @property
+    def msg(self) -> CommandMessage:
+        return self.cmd.msg
     
     @property
     def cmd_id(self) -> str:
@@ -1036,34 +1150,35 @@ class InteractiveInput(
     
     @property
     def session_writer(self) -> MessageHandler:
-        return self.cli.session_writer
+        return self.cmd.session_writer
     
     @property
     def session_id(self) -> str:
-        return self.cli.session_info.session_id
+        return self.cmd.session_info.session_id
+    
+    @property
+    def state(self) -> State:
+        return self.cmd.state
     
     @property
     def cmd_running(self) -> bool:
-        return self.cli.state.cmd_running.is_set()
+        return self.cmd.state.cmd_running.is_set()
     
-    def run(self) -> None:
+    def before_running(self) -> bool:
+        return True
+    
+    def running(self) -> None:
         logger.info(
-            f'You are in the interactive mode. Use ``Ctrl+C`` to '
-            'terminate the command as usual, and use ``Ctrl+D`` to '
-            'quit the interactive input.'
+            f'You are in the interactive mode.'
         )
+        session_writer = self.session_writer
+        state = self.state
         while True:
             try:
                 input_str = input()
                 if not self.cmd_running:
                     raise EOFError
-                if self.keyboard_interrupt.is_set():
-                    # Clear to check the next keyboard 
-                    # interrupt event.
-                    self.keyboard_interrupt.clear()
-                    # Ignore the current input.
-                    continue
-                self.session_writer.write(
+                session_writer.write(
                     Message(
                         session_id=self.session_id,
                         type='cmd_input',
@@ -1073,14 +1188,22 @@ class InteractiveInput(
                         }
                     )
                 )
+            except KeyboardInterrupt:
+                if not self.cmd_running:
+                    logger.info(f'Interactive mode quitted.')
+                    return
+                print('Keyboard Interrupt (Interactive Input).')
+                state.add_keyboard_interrupt()
             except EOFError:
                 if not self.cmd_running:
-                    logger.info(
-                        f'Interactive mode quitted.'
-                    )
+                    logger.info(f'Interactive mode quitted.')
                     return
+                print('EOF (Interactive Input).')
             except Exception as e:
-                logger.error(str(e))
+                logger.error(str(e), stack_info=True)
+    
+    def after_running(self, __exc_type=None, __exc_value=None, __traceback=None):
+        self.quit.set()
 
 #
 # Command argument parsers.
