@@ -1,10 +1,14 @@
 import os
 import time
+from argparse import ArgumentParser
+from slime_core.utils.base import Base
 from slime_core.utils.typing import (
     MISSING,
     Union,
     Any,
-    Tuple
+    Tuple,
+    Sequence,
+    Missing
 )
 
 
@@ -120,3 +124,23 @@ def xor__(__x: Any, __y: Any) -> bool:
         (__x and not __y) or 
         (not __x and __y)
     )
+
+
+def parser_parse(
+    parser: ArgumentParser,
+    args: Union[Sequence[str], Missing, None] = MISSING,
+    strict: bool = True
+) -> Union[Base, Missing]:
+    """
+    Argument parse args with ``Base`` object as namespace.
+    """
+    namespace = MISSING
+    try:
+        if args is MISSING:
+            namespace = parser.parse_args(namespace=Base())
+        else:
+            namespace = parser.parse_args(args=args, namespace=Base())
+    except SystemExit:
+        if strict:
+            raise
+    return namespace

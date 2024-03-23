@@ -1,12 +1,13 @@
 import argparse
 from fake_cmd.core.server import Server
+from fake_cmd.utils import parser_parse
 
 
 def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--address', type=str, required=True)
     parser.add_argument('--max_cmds', type=int, default=100, required=False)
-    return parser.parse_args()
+    return parser_parse(parser)
 
 
 if __name__ == '__main__':

@@ -49,7 +49,8 @@ from fake_cmd.utils import (
     config,
     polling,
     get_server_name,
-    version_check
+    version_check,
+    parser_parse
 )
 from fake_cmd.utils.logging import logger
 from . import SessionInfo, ActionFunc, dispatch_action, param_check
@@ -600,15 +601,16 @@ class CLI(
         cmd_splits = shlex.split(cmd)
         cli_func = self.cli_registry.get(cmd_splits[0], MISSING)
         if cli_func is MISSING:
-            try:
-                # All the cmd_splits will be seen as part of the command.
-                args = self.cmd_parser.parse_args(
-                    ['--'] + cmd_splits
-                )
-                args.interactive = False
-            except:
+            # All the cmd_splits will be seen as part of the command.
+            args = parser_parse(
+                parser=self.cmd_parser,
+                args=(['--'] + cmd_splits),
+                strict=False
+            )
+            if args is MISSING:
                 return False
             
+            args.interactive = False
             return self.send_session_cmd(
                 content=self._make_cmd_content_through_args(args),
                 type='cmd'
@@ -870,12 +872,15 @@ class CLI(
         """
         Open command in an interactive mode.
         """
-        try:
-            args = self.inter_cmd_parser.parse_args(cmd_splits[1:])
-            args.interactive = True
-        except:
+        args = parser_parse(
+            parser=self.inter_cmd_parser,
+            args=cmd_splits[1:],
+            strict=False
+        )
+        if args is MISSING:
             return False
         
+        args.interactive = True
         return self.send_session_cmd(
             content=self._make_cmd_content_through_args(args),
             type='cmd'
@@ -884,12 +889,15 @@ class CLI(
     @cli_registry(key='cmd')
     @cli_action_version_check(min_version=(0, 0, 2))
     def escape_cmd(self, cmd_splits: List[str]) -> Union[CommandMessage, bool]:
-        try:
-            args = self.cmd_parser.parse_args(cmd_splits[1:])
-            args.interactive = False
-        except:
+        args = parser_parse(
+            parser=self.cmd_parser,
+            args=cmd_splits[1:],
+            strict=False
+        )
+        if args is MISSING:
             return False
         
+        args.interactive = False
         return self.send_session_cmd(
             content=self._make_cmd_content_through_args(args),
             type='cmd'
