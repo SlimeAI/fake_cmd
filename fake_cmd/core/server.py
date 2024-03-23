@@ -194,6 +194,7 @@ class Server(
         with ignore_keyboard_interrupt():
             logger.info('Server shutting down...')
             self.cmd_pool.pool_close.set()
+            # Destroy sessions.
             # Use a new tuple, because the ``exit_callback`` will pop 
             # the dict items.
             sessions = tuple(self.session_dict.values())
@@ -202,6 +203,10 @@ class Server(
             logger.info('Waiting sessions to destroy...')
             for session in sessions:
                 session.join(config.server_shutdown_wait_timeout)
+            # Kill all the commands in the command pool.
+            for cmd in tuple(self.cmd_pool.update_and_get_execute()):
+                cmd.process.kill()
+            # Check the shutdown state.
             if any(map(lambda session: session.is_alive(), sessions)):
                 logger.warning(
                     'Warning: there are still sessions undestroyed. Ignoring and shutdown...'
@@ -371,6 +376,16 @@ class Session(
         # Further confirm the command is terminated.
         self.safely_terminate_cmd(cause='destroy')
         self.clear_cache()
+        # Kill all the background commands.
+        for back_cmd in tuple(self.background_cmds.update_and_get()):
+            back_cmd.process.kill()
+        
+        # Wait all the commands to finish.
+        running_cmd = self.running_cmd
+        if running_cmd:
+            running_cmd.join()
+        for back_cmd in tuple(self.background_cmds.update_and_get()):
+            back_cmd.join()
     
     #
     # Actions.
@@ -944,29 +959,29 @@ class ShellCommand(Command):
             Process the kill signals (SIGINT, SIGTERM, SIGKILL, etc.)
             """
             nonlocal kill_sent, terminate_sent, interrupt_sent
-            if kill_disabled:
-                # Can send keyboard interrupt multiple times according to 
-                # the user behavior.
-                if state.keyboard_interrupt.is_set():
-                    process.keyboard_interrupt()
-                    state.keyboard_interrupt.clear()
-            elif (
-                state.force_kill.is_set() and 
-                not kill_sent
+            if (
+                (
+                    state.terminate_local.is_set() or 
+                    state.terminate_disconnect.is_set() or 
+                    state.force_kill.is_set()
+                ) and not kill_sent
             ):
                 # Directly kill the process.
                 process.kill()
                 kill_sent = True
             elif (
-                (
-                    state.terminate_local.is_set() or 
-                    state.terminate_disconnect.is_set() or 
-                    state.terminate_remote.is_set()
-                ) and not terminate_sent
+                state.terminate_remote.is_set() and 
+                not terminate_sent
             ):
                 # Terminate the process.
                 process.terminate()
                 terminate_sent = True
+            elif kill_disabled:
+                if state.keyboard_interrupt.is_set():
+                    # Can send keyboard interrupt multiple times 
+                    # according to the user behavior.
+                    process.keyboard_interrupt()
+                    state.keyboard_interrupt.clear()
             elif (
                 state.keyboard_interrupt.is_set() and 
                 not interrupt_sent
