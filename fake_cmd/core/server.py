@@ -990,32 +990,33 @@ class ShellCommand(Command):
                 process.keyboard_interrupt()
                 interrupt_sent = True
         
-        for _ in polling(config.cmd_polling_interval):
-            # NOTE: DO NOT return after the signal is sent, 
-            # and it should always wait until the process 
-            # quits.
-            _process_kill_signals()
-            # Write outputs.
-            self.output_writer.write(
-                reader.read(config.cmd_pipe_read_timeout)
-            )
+        with process:
+            for _ in polling(config.cmd_polling_interval):
+                # NOTE: DO NOT return after the signal is sent, 
+                # and it should always wait until the process 
+                # quits.
+                _process_kill_signals()
+                # Write outputs.
+                self.output_writer.write(
+                    reader.read(config.cmd_pipe_read_timeout)
+                )
+                
+                if process.poll() is not None:
+                    break
             
-            if process.poll() is not None:
-                break
-        
-        if not state.pending_terminate:
-            # Read all the remaining content.
-            self.output_writer.write(reader.read_all())
-            # Normally finished.
-            state.finished.set()
-        else:
-            # Read the remaining output within a timeout. This is because 
-            # if the command is not properly terminated (e.g., the main Popen 
-            # process is killed, but its subprocesses are still alive and 
-            # producing outputs), the command may get stuck reading endlessly.
-            self.output_writer.write(
-                reader.read(config.cmd_pipe_read_timeout_when_terminate)
-            )
+            if not state.pending_terminate:
+                # Read all the remaining content.
+                self.output_writer.write(reader.read_all())
+                # Normally finished.
+                state.finished.set()
+            else:
+                # Read the remaining output within a timeout. This is because 
+                # if the command is not properly terminated (e.g., the main Popen 
+                # process is killed, but its subprocesses are still alive and 
+                # producing outputs), the command may get stuck reading endlessly.
+                self.output_writer.write(
+                    reader.read(config.cmd_pipe_read_timeout_when_terminate)
+                )
     
     def after_running(self, __exc_type=None, __exc_value=None, __traceback=None):
         self.stdin.close()

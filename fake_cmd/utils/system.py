@@ -75,6 +75,12 @@ class PlatformPopen(
         Send signal to the process.
         """
         pass
+    
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, *args, **kwargs):
+        return self.popen_obj.__exit__(*args, **kwargs)
 
 
 platform_open_registry = Registry[Type[PlatformPopen]]('platform_open_registry')
