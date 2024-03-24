@@ -109,6 +109,7 @@ class State(ReadonlyAttr):
         'connected',
         'connection_failed',
         'cmd_running',
+        'cmd_running_lock',
         'cmd_terminate_remote',
         'keyboard_interrupt_lock',
         'keyboard_interrupt_max_cnt',
@@ -125,6 +126,7 @@ class State(ReadonlyAttr):
         self.connection_failed = Event()
         # Indicator that whether a command is running.
         self.cmd_running = Event()
+        self.cmd_running_lock = RLock()
         # Command terminated from remote.
         self.cmd_terminate_remote = Event()
         # Counting the "KeyboardInterrupt" Events.
@@ -147,11 +149,11 @@ class State(ReadonlyAttr):
         self.cli_exit = Event()
     
     def reset(self) -> None:
-        self.cmd_running.clear()
         self.cmd_terminate_remote.clear()
         # Reset the keyboard interrupt.
         self.reset_keyboard_interrupt()
         self.cmd_finished.clear()
+        self.set_cmd_running(False)
     
     @contextmanager
     def reset_ctx(self):
@@ -179,6 +181,13 @@ class State(ReadonlyAttr):
     def get_keyboard_interrupt(self) -> int:
         with self.keyboard_interrupt_lock:
             return self.keyboard_interrupt
+    
+    def set_cmd_running(self, running: bool) -> None:
+        with self.cmd_running_lock:
+            if running:
+                self.cmd_running.set()
+            else:
+                self.cmd_running.clear()
 
 
 def cli_action_version_check(
@@ -293,7 +302,7 @@ class CLI(
     def running(self):
         state = self.state
         
-        def safe_check_terminate() -> bool:
+        def safely_check_terminate() -> bool:
             """
             Safely check whether to terminate.
             """
@@ -311,7 +320,7 @@ class CLI(
                 with state.reset_ctx():
                     # The terminate state should be checked before and after the 
                     # cmd input.
-                    if safe_check_terminate(): return
+                    if safely_check_terminate(): return
                     try:
                         cmd_str = input(self.input_hint)
                     except KeyboardInterrupt:
@@ -321,7 +330,7 @@ class CLI(
                         print('EOF (CLI Input).')
                         continue
                     finally:
-                        if safe_check_terminate(): return
+                        if safely_check_terminate(): return
                 
                 # Process the command.
                 with state.reset_ctx():
@@ -333,7 +342,7 @@ class CLI(
                 print('CLI exiting...')
                 return
             except KeyboardInterrupt:
-                print('Keyboard Interrupt.')
+                print('Keyboard Interrupt (CLI).')
             except BaseException as e:
                 logger.error(str(e), stack_info=True)
     
@@ -417,9 +426,17 @@ class CLI(
             state = self.state
             cmd_input = cmd.cmd_input
             interactive = cmd.interactive
+            # Set ``cmd_running`` here in advance, because the 
+            # command thread may not have set the ``cmd_running`` 
+            # Event before the below ``while True`` block starts 
+            # running, and the ``while True`` will return if 
+            # ``cmd_running`` is not set.
+            state.set_cmd_running(True)
             cmd.start()
         while True:
             try:
+                if not cmd.safely_check_cmd_running():
+                    return
                 if interactive:
                     # NOTE: Keyboard Interrupt may not be 
                     # caught in the ``run`` function (because 
@@ -428,11 +445,20 @@ class CLI(
                     # in the outside try-except clause to keep 
                     # it safe.
                     cmd_input.run()
-                cmd.join()
-                break
+                for _ in polling(config.cmd_polling_interval):
+                    # NOTE: In higher versions of Python (e.g., Python 3.10), 
+                    # thread.is_alive will return False and thread.join will 
+                    # directly return after a keyboard interrupt event is raised. 
+                    # However, the thread is still running, causing inconsistency. 
+                    # So we further check whether ``cmd_running`` Event is cleared 
+                    # to make sure that the ``cmd`` thread has finished.
+                    # This bug will appear at least in macOS.
+                    if not cmd.safely_check_cmd_running():
+                        return
             except KeyboardInterrupt:
-                print('Keyboard Interrupt (CLI Command).')
-                state.add_keyboard_interrupt()
+                with ignore_keyboard_interrupt():
+                    print('Keyboard Interrupt (CLI Command).')
+                    state.add_keyboard_interrupt()
     
     #
     # Actions.
@@ -901,7 +927,7 @@ class Command(
     
     def before_running(self) -> bool:
         # Set that the command is running.
-        self.state.cmd_running.set()
+        self.state.set_cmd_running(True)
         return True
     
     def running(self):
@@ -927,6 +953,13 @@ class Command(
         keyboard_interrupt_sent = False
         terminate_sent = False
         kill_sent = False
+        
+        if kill_disabled:
+            logger.info(
+                'You are disabling the Keyboard Interrupt to kill a command, '
+                'and you need to manually quit the command using specified input '
+                '(e.g., ``exit()`` in Python, ``exit`` in bash, etc.).'
+            )
         
         #
         # For loop functions (to make the for loop clear and more 
@@ -1071,18 +1104,20 @@ class Command(
                 f'Exception occurred in command. {str(__exc_type)} - {str(__exc_value)}',
                 stack_info=True
             )
-        # Set that the command finished (for the interactive).
-        self.state.cmd_running.clear()
-        if self.interactive:
-            if not self.cmd_input.quit.is_set():
-                logger.info(
-                    'The command has exited, and you need to press '
-                    '``Ctrl+C`` or ``Enter`` to further quit the '
-                    'interactive mode.'
-                )
         # Remove all files.
         remove_file_with_retry(confirm_fp)
         remove_dir_with_retry(output_namespace)
+        state = self.state
+        with state.cmd_running_lock:
+            if self.interactive:
+                if not self.cmd_input.quit.is_set():
+                    logger.info(
+                        'The command has exited, and you need to press '
+                        '``Ctrl+C`` or ``Enter`` to further quit the '
+                        'interactive mode.'
+                    )
+            # Set that the command is not running.
+            state.set_cmd_running(False)
     
     def redirect_output(
         self,
@@ -1118,6 +1153,19 @@ class Command(
         sys.stdout.write(content)
         sys.stdout.flush()
         return True
+    
+    def safely_check_cmd_running(self) -> bool:
+        """
+        Safely check the command running states.
+        """
+        state = self.state
+        running = True
+        if not state.cmd_running.is_set():
+            running = False
+        with state.cmd_running_lock:
+            if not state.cmd_running.is_set():
+                running = False
+        return (running or self.is_alive())
     
     def __bool__(self) -> bool:
         return True
@@ -1161,9 +1209,10 @@ class InteractiveInput(
     
     @property
     def cmd_running(self) -> bool:
-        return self.cmd.state.cmd_running.is_set()
+        return self.cmd.safely_check_cmd_running()
     
     def before_running(self) -> bool:
+        self.quit.clear()
         return True
     
     def running(self) -> None:
@@ -1188,16 +1237,18 @@ class InteractiveInput(
                     )
                 )
             except KeyboardInterrupt:
-                if not self.cmd_running:
-                    logger.info(f'Interactive mode quitted.')
-                    return
-                print('Keyboard Interrupt (Interactive Input).')
-                state.add_keyboard_interrupt()
+                with ignore_keyboard_interrupt():
+                    if not self.cmd_running:
+                        logger.info(f'Interactive mode quitted.')
+                        return
+                    print('Keyboard Interrupt (Interactive Input).')
+                    state.add_keyboard_interrupt()
             except EOFError:
-                if not self.cmd_running:
-                    logger.info(f'Interactive mode quitted.')
-                    return
-                print('EOF (Interactive Input).')
+                with ignore_keyboard_interrupt():
+                    if not self.cmd_running:
+                        logger.info(f'Interactive mode quitted.')
+                        return
+                    print('EOF (Interactive Input).')
             except Exception as e:
                 logger.error(str(e), stack_info=True)
     
