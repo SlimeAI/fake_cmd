@@ -76,6 +76,7 @@ class CommandState(ReadonlyAttr):
     
     readonly_attr__ = (
         'keyboard_interrupt_remote',
+        'kill_disabled',
         'terminate_local',
         'terminate_remote',
         'terminate_disconnect',
@@ -90,6 +91,8 @@ class CommandState(ReadonlyAttr):
     def __init__(self) -> None:
         # Keyboard interrupt from remote.
         self.keyboard_interrupt = Event()
+        # Whether keyboard interrupt is not used to kill the command.
+        self.kill_disabled = Event()
         # Terminate from local.
         self.terminate_local = Event()
         # Terminate from remote.
@@ -119,7 +122,10 @@ class CommandState(ReadonlyAttr):
             self.terminate_remote.is_set() or 
             self.terminate_disconnect.is_set() or 
             self.force_kill.is_set() or 
-            self.keyboard_interrupt.is_set()
+            (
+                self.keyboard_interrupt.is_set() and
+                not self.kill_disabled.is_set()
+            )
         )
 
 
@@ -891,7 +897,7 @@ class Command(
             f'Command(cmd="{self.msg.content["cmd"]}", cmd_id="{self.msg.cmd_id}", '
             f'session_id="{self.session_info.session_id}", '
             f'created_time={timestamp_to_str(self.msg.timestamp)}, '
-            f'pid={str(self.process.pid)})'
+            f'pid={str(self.process.pid)}, writer={self.stdin.to_str()})'
         )
     
     def __bool__(self) -> bool:
@@ -917,6 +923,9 @@ class ShellCommand(Command):
         encoding: Union[str, None] = content['encoding']
         stdin: Union[str, None] = content['stdin']
         
+        if self.msg.kill_disabled:
+            # Set kill disabled.
+            self.cmd_state.kill_disabled.set()
         self.encoding = encoding or config.cmd_pipe_encoding
         if stdin:
             self.stdin = popen_writer_registry.get(stdin, PopenWriter)(encoding=self.encoding)
@@ -926,7 +935,6 @@ class ShellCommand(Command):
     def running(self) -> None:
         msg = self.msg
         content = msg.content
-        kill_disabled = msg.kill_disabled
         state = self.cmd_state
         process = platform_open_registry.get(self.platform, DefaultPopen)(
             popen_params=FuncParams(
@@ -976,7 +984,7 @@ class ShellCommand(Command):
                 # Terminate the process.
                 process.terminate()
                 terminate_sent = True
-            elif kill_disabled:
+            elif state.kill_disabled.is_set():
                 if state.keyboard_interrupt.is_set():
                     # Can send keyboard interrupt multiple times 
                     # according to the user behavior.
@@ -989,6 +997,14 @@ class ShellCommand(Command):
                 # Send keyboard interrupt.
                 process.keyboard_interrupt()
                 interrupt_sent = True
+            
+            if state.pending_terminate:
+                # NOTE: Should close the stdin here if possible. 
+                # Otherwise, writers like 'pty' will never be closed. 
+                # ``PipeWriter`` will do nothing here, because the 
+                # ``__exit__`` of ``process`` will close stdin 
+                # automatically.
+                self.stdin.close()
         
         with process:
             for _ in polling(config.cmd_polling_interval):
@@ -1017,10 +1033,6 @@ class ShellCommand(Command):
                 self.output_writer.write(
                     reader.read(config.cmd_pipe_read_timeout_when_terminate)
                 )
-    
-    def after_running(self, __exc_type=None, __exc_value=None, __traceback=None):
-        self.stdin.close()
-        return super().after_running(__exc_type, __exc_value, __traceback)
 
 
 class InnerCommand(Command):
@@ -1090,6 +1102,9 @@ class InnerCommand(Command):
                 for index, cmd in enumerate(cmd_pool.queue):
                     output_writer.print(f'({index}) {cmd.to_str()}')
 
+#
+# Background Command
+#
 
 class BackgroundCommandList(
     BaseList[Command],
@@ -1209,6 +1224,9 @@ class PipeReader(ReadonlyAttr):
 
 
 class PopenWriter(ReadonlyAttr):
+    """
+    Interface to write user input to the process.
+    """
     readonly_attr__ = ('encoding',)
     
     def __init__(
@@ -1235,6 +1253,9 @@ class PopenWriter(ReadonlyAttr):
         Close the stdin.
         """
         pass
+    
+    def to_str(self) -> str:
+        return f'{self.__class__.__name__}()'
 
 
 default_popen_writer = PopenWriter()
@@ -1245,17 +1266,18 @@ popen_writer_registry = Registry[Type[PopenWriter]]('popen_writer_registry')
 class PipeWriter(PopenWriter):
     
     def write(self, content: str) -> bool:
-        if not self.process.stdin:
+        popen_stdin = self.process.stdin
+        if not popen_stdin:
             logger.warning(
                 'Popen stdin or its pipe is NoneOrNothing.'
             )
             return False
         
         try:
-            self.process.stdin.write(
+            popen_stdin.write(
                 content.encode(self.encoding)
             )
-            self.process.stdin.flush()
+            popen_stdin.flush()
         except Exception as e:
             logger.error(str(e), stack_info=True)
             return False
@@ -1267,6 +1289,21 @@ class PipeWriter(PopenWriter):
     
     def get_popen_stdin(self):
         return subprocess.PIPE
+    
+    def close(self):
+        # Do nothing here, because the subprocess 
+        # will automatically close the stdin on 
+        # ``__exit__``.
+        return
+    
+    def to_str(self) -> str:
+        popen_stdin = self.process.stdin
+        fileno = popen_stdin.fileno() if popen_stdin else None
+        return (
+            f'{self.__class__.__name__}'
+            f'(stdin={str(popen_stdin)}, '
+            f'stdin_fileno={str(fileno)})'
+        )
 
 
 @popen_writer_registry(key='pty')
@@ -1303,6 +1340,7 @@ class PtyWriter(PopenWriter):
         return self.slave
     
     def close(self):
+        # Should manually close the pty.
         try:
             os.close(self.master)
         except Exception as e:
@@ -1312,3 +1350,9 @@ class PtyWriter(PopenWriter):
             os.close(self.slave)
         except Exception as e:
             logger.error(str(e), stack_info=True)
+    
+    def to_str(self) -> str:
+        return (
+            f'{self.__class__.__name__}'
+            f'(master={self.master}, slave={self.slave})'
+        )
