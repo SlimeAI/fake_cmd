@@ -25,7 +25,8 @@ from slime_core.utils.typing import (
     Missing,
     MISSING,
     List,
-    Literal
+    Literal,
+    Iterable
 )
 from .exception import retry_deco
 from . import polling, config, xor__
@@ -347,17 +348,22 @@ class SequenceFileHandler(
             return
         
         with self.fp_queue_lock:
+            # Filter writer lock files.
+            fname_iter = filter(
+                lambda fname: not fname.endswith(SINGLE_WRITER_LOCK_FILE_EXTENSION),
+                os.listdir(self.namespace)
+            )
             # Sort the file names.
-            fname_list = self.sort(os.listdir(self.namespace))
+            fname_list = self.sort(fname_iter)
             # Get the full file paths and filter files with writer lock.
             self.fp_queue.extend(
                 filterfalse(check_single_writer_lock, map(self.get_fp, fname_list))
             )
     
     @abstractmethod
-    def sort(self, fname_list: List[str]) -> List[str]:
+    def sort(self, fname_iter: Iterable[str]) -> List[str]:
         """
-        Return the sorted sequence of ``fname_list``.
+        Return the sorted sequence of ``fname_iter``.
         """
         pass
     
@@ -395,7 +401,7 @@ class OutputFileHandler(SequenceFileHandler):
     def print(self, content: str, exist_ok: bool = False):
         return self.write(f'{content}\n', exist_ok=exist_ok)
     
-    def sort(self, fname_list: List[str]) -> List[str]:
+    def sort(self, fname_iter: Iterable[str]) -> List[str]:
         """
         Sort the output file names by timestamps.
         """
@@ -411,14 +417,14 @@ class OutputFileHandler(SequenceFileHandler):
             """
             try:
                 get_timestamp(fname)
-                # NOTE: Should ignore the writer lock files.
-                return not fname.endswith(SINGLE_WRITER_LOCK_FILE_EXTENSION)
             except Exception:
                 remove_file_with_retry(self.get_fp(fname))
                 return False
+            else:
+                return True
         
         return sorted(
-            filter(filter_valid_fname, fname_list),
+            filter(filter_valid_fname, fname_iter),
             key=lambda fp: get_timestamp(fp)
         )
     
@@ -426,7 +432,7 @@ class OutputFileHandler(SequenceFileHandler):
         """
         Generate a unique file name with timestamp for sorting.
         """
-        return f'{str(time.time())}{OutputFileHandler.fname_sep}{uuid.uuid4()}'
+        return f'{str(time.time())}{OutputFileHandler.fname_sep}{uuid.uuid4()}.output'
 
 
 class MessageHandler(SequenceFileHandler):
@@ -525,7 +531,7 @@ class MessageHandler(SequenceFileHandler):
                 f'Retrying sending the message: {msg_json}'
             )
     
-    def sort(self, fname_list: List[str]) -> List[str]:
+    def sort(self, fname_iter: Iterable[str]) -> List[str]:
         """
         Sort the message file names by timestamps.
         """
@@ -541,14 +547,14 @@ class MessageHandler(SequenceFileHandler):
             """
             try:
                 get_timestamp(fname)
-                # NOTE: Should ignore the writer lock files.
-                return not fname.endswith(SINGLE_WRITER_LOCK_FILE_EXTENSION)
             except Exception:
                 remove_file_with_retry(self.get_fp(fname))
                 return False
+            else:
+                return True
         
         return sorted(
-            filter(filter_valid_fname, fname_list),
+            filter(filter_valid_fname, fname_iter),
             key=lambda fp: get_timestamp(fp)
         )
 
