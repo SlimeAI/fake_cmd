@@ -961,12 +961,14 @@ class ShellCommand(Command):
         interrupt_sent = False
         terminate_sent = False
         kill_sent = False
+        stdin_closed = False
         
         def _process_kill_signals():
             """
             Process the kill signals (SIGINT, SIGTERM, SIGKILL, etc.)
             """
             nonlocal kill_sent, terminate_sent, interrupt_sent
+            nonlocal stdin_closed
             if (
                 (
                     state.terminate_local.is_set() or 
@@ -998,13 +1000,17 @@ class ShellCommand(Command):
                 process.keyboard_interrupt()
                 interrupt_sent = True
             
-            if state.pending_terminate:
+            if (
+                state.pending_terminate and 
+                not stdin_closed
+            ):
                 # NOTE: Should close the stdin here if possible. 
                 # Otherwise, writers like 'pty' will never be closed. 
                 # ``PipeWriter`` will do nothing here, because the 
                 # ``__exit__`` of ``process`` will close stdin 
                 # automatically.
                 self.stdin.close()
+                stdin_closed = True
         
         with process:
             for _ in polling(config.cmd_polling_interval):
@@ -1202,6 +1208,10 @@ class PipeReader(ReadonlyAttr):
         for key, _ in self.selector.select(0):
             if key.fileobj == self.stdout:
                 # If ready, read all and return.
+                try:
+                    self.stdout.flush()
+                except Exception as e:
+                    logger.error(str(e), stack_info=True)
                 return str(
                     self.bytes_parser.parse(self.stdout.read())
                 )
