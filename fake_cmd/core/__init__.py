@@ -15,7 +15,7 @@ from fake_cmd.utils.comm import Message, CommandMessage, create_symbol
 from fake_cmd.utils.file import remove_dir_with_retry, remove_file_with_retry
 from fake_cmd.utils.logging import logger
 
-SESSION_ID_SUFFIX = '__fake_cmd_session__'
+SESSION_ID_SUFFIX = '__fcmd_sess'
 
 
 class ServerInfo(ReadonlyAttr):
