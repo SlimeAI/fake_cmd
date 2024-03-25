@@ -51,10 +51,11 @@ from fake_cmd.utils import (
     polling,
     get_server_name,
     version_check,
-    parser_parse
+    parser_parse,
+    uuid_base36
 )
 from fake_cmd.utils.logging import logger
-from . import SessionInfo, ActionFunc, dispatch_action, param_check
+from . import SessionInfo, ActionFunc, dispatch_action, param_check, SESSION_ID_SUFFIX
 from .server import popen_writer_registry
 
 # Keyboard interrupt count corresponding to different meanings.
@@ -623,7 +624,7 @@ class Client(
         LifecycleRun.__init__(self)
         Thread.__init__(self)
         # Create a new session id.
-        session_id = str(uuid.uuid1())
+        session_id = f'{uuid_base36(uuid.uuid1().int)}{SESSION_ID_SUFFIX}'
         if id_prefix:
             session_id = f'{id_prefix}-{session_id}'
         self.session_info = SessionInfo(address, session_id)

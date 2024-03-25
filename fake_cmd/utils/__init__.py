@@ -1,5 +1,6 @@
 import os
 import time
+from itertools import chain
 from argparse import ArgumentParser, Namespace
 from slime_core.utils.typing import (
     MISSING,
@@ -29,8 +30,8 @@ class Config:
         self.cmd_pipe_read_timeout: float = 0.03
         self.cmd_pipe_read_timeout_when_terminate: float = 0.5
         # Limit on the number of files.
-        self.max_message_files: int = 10000
-        self.max_output_files: int = 10000
+        self.max_message_files: int = 1000
+        self.max_output_files: int = 1000
         # command pipe output encoding method.
         self.cmd_pipe_encoding: str = 'utf-8'
         self.cmd_executable: Union[str, None] = None
@@ -180,3 +181,23 @@ class LessThanAnything:
     def __eq__(self, __value: Any) -> bool: return False
     def __gt__(self, __value: Any) -> bool: return False
     def __ge__(self, __value: Any) -> bool: return False
+
+#
+# UUID compression
+#
+
+BASE36_CHARS = ''.join(chr(i) for i in chain(range(48, 58), range(97, 123)))
+# Number of digits needed to represent a 32-bit hexadecimal number.
+NUMBER_DIGITS = 25
+
+
+def uuid_base36(number: int) -> str:
+    """
+    Convert a uuid to the base36 format.
+    """
+    base36_num = ''
+    while number > 0:
+        number, remainder = divmod(number, 36)
+        base36_num = BASE36_CHARS[remainder] + base36_num
+    
+    return base36_num.rjust(NUMBER_DIGITS, '0')

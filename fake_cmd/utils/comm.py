@@ -32,7 +32,7 @@ from slime_core.utils.typing import (
     STOP
 )
 from .exception import retry_deco
-from . import polling, config, xor__, LessThanAnything
+from . import polling, config, xor__, LessThanAnything, uuid_base36
 from .logging import logger
 from .file import (
     remove_file_with_retry,
@@ -96,7 +96,7 @@ class Message(ReadonlyAttr):
             content = {}
         self.content = content
         self.timestamp = timestamp or time.time()
-        self.msg_id = msg_id or str(uuid.uuid4())
+        self.msg_id = msg_id or uuid_base36(uuid.uuid4().int)
     
     @property
     def confirm_fname(self) -> str:
@@ -465,7 +465,9 @@ class OutputFileHandler(SequenceFileHandler):
         """
         Generate a unique file name with timestamp for sorting.
         """
-        return f'{str(time.time())}{OutputFileHandler.fname_sep}{uuid.uuid4()}.output'
+        # The order of output files strongly rely on the accurate time, 
+        # so we use ``time.time_ns`` here.
+        return f'{time.time_ns()}{OutputFileHandler.fname_sep}{uuid_base36(uuid.uuid4().int)}.output'
 
 
 class MessageHandler(SequenceFileHandler):
