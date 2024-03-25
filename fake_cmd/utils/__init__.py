@@ -15,33 +15,41 @@ class Config:
     
     def __init__(self) -> None:
         # Common polling interval
-        self.polling_interval = 0.5
+        self.polling_interval: float = 0.1
         # NOTE: The cmd is responsible for content output, 
         # so the polling interval should be short.
-        self.cmd_polling_interval = 0.01
+        self.cmd_polling_interval: float = 0.01
         # Read the subprocess pipe output within the timeout 
         # and return.
-        self.cmd_pipe_read_timeout = 0.01
-        self.cmd_pipe_read_timeout_when_terminate = 0.5
+        # NOTE: This should be slightly larger than the 
+        # ``cmd_polling_interval``, because this value determines 
+        # how fast a new output file is created, and it should 
+        # be slower than the client consuming the output files 
+        # to avoid new files piling up in the long term.
+        self.cmd_pipe_read_timeout: float = 0.03
+        self.cmd_pipe_read_timeout_when_terminate: float = 0.5
+        # Limit on the number of files.
+        self.max_message_files: int = 10000
+        self.max_output_files: int = 10000
         # command pipe output encoding method.
         self.cmd_pipe_encoding: str = 'utf-8'
         self.cmd_executable: Union[str, None] = None
         # When ``kill_cmd`` is sent or client terminated, 
         # read the remaining content util timeout.
-        self.cmd_client_read_timeout = 1.0
-        self.cmd_pool_schedule_interval = 0.5
+        self.cmd_client_read_timeout: float = 1.0
+        self.cmd_pool_schedule_interval: float = 0.2
         # Server shutdown wait timeout.
-        self.server_shutdown_wait_timeout = 5.0
+        self.server_shutdown_wait_timeout: float = 5.0
         # Common symbol wait timeout.
-        self.wait_timeout = 10.0
+        self.wait_timeout: float = 10.0
         # Retries
         self.send_msg_retries: int = 3
         self.msg_confirm_wait_timeout: float = 3.0
         self.exception_retries: int = 3
         self.exception_wait_timeout: float = 0.5
         # Heartbeat settings.
-        self.heartbeat_interval = 10.0
-        self.heartbeat_timeout = 600.0
+        self.heartbeat_interval: float = 10.0
+        self.heartbeat_timeout: float = 600.0
         # The version info for compatibility check.
         self.version: Tuple[int, int, int] = (0, 0, 3)
         # For system settings.

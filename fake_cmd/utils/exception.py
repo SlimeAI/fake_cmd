@@ -10,7 +10,8 @@ from slime_core.utils.typing import (
     Type,
     Callable,
     TypeVar,
-    Union
+    Union,
+    Tuple
 )
 from . import config
 from .logging import logger
@@ -36,7 +37,7 @@ class ExceptionInfo(BaseList[BaseException]):
 
 def retry(
     func: Callable[[], _T],
-    suppress_exc: Type[BaseException] = Exception,
+    suppress_exc: Union[Type[BaseException], Tuple[Type[BaseException], ...]] = Exception,
     max_retries: Union[int, Missing] = MISSING,
     exception_wait_timeout: Union[float, Missing] = MISSING
 ) -> Union[_T, ExceptionInfo]:
@@ -78,7 +79,7 @@ def retry(
 
 
 def retry_deco(
-    suppress_exc: Type[BaseException] = Exception,
+    suppress_exc: Union[Type[BaseException], Tuple[Type[BaseException], ...]] = Exception,
     max_retries: Union[int, Missing] = MISSING,
     exception_wait_timeout: Union[float, Missing] = MISSING
 ) -> Callable[[_CallableT], _CallableT]:

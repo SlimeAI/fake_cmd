@@ -26,7 +26,9 @@ from slime_core.utils.typing import (
     MISSING,
     List,
     Literal,
-    Iterable
+    Iterable,
+    Stop,
+    STOP
 )
 from .exception import retry_deco
 from . import polling, config, xor__
@@ -210,13 +212,18 @@ class SequenceFileHandler(
     Process files in a namespace with specified sorting method. 
     Best compatible with single-writer.
     """
-    readonly_attr__ = ('namespace',)
+    readonly_attr__ = (
+        'namespace',
+        'max_files'
+    )
     
     def __init__(
         self,
         namespace: str,
+        max_files: int
     ):
         self.namespace = namespace
+        self.max_files = max_files
         # file path queue, for sequence read.
         self.fp_queue = BaseList[str]()
         self.fp_queue_lock = RLock()
@@ -308,13 +315,31 @@ class SequenceFileHandler(
         self,
         fname: str,
         content: str,
-        exist_ok: bool = False
-    ) -> bool:
+        exist_ok: bool = False,
+        empty_ok: bool = False
+    ) -> Union[bool, Missing, Stop]:
         """
         Safely write a file with single writer lock. 
         Return whether the writing operation succeeded.
         """
         if not self.check_namespace():
+            return False
+        
+        # Optimization: Avoid writing empty content.
+        if (
+            not content and 
+            not empty_ok
+        ):
+            return MISSING
+        
+        try:
+            # Optimization: Avoid piling up too many files in 
+            # the folder.
+            num_files = len(os.listdir(self.namespace))
+            if num_files >= self.max_files:
+                return STOP
+        except Exception as e:
+            logger.error(str(e), stack_info=True)
             return False
         
         fp = self.get_fp(fname)
@@ -388,6 +413,13 @@ class OutputFileHandler(SequenceFileHandler):
     # for file sorting.
     fname_sep = '__'
     
+    def __init__(self, namespace: str):
+        SequenceFileHandler.__init__(
+            self,
+            namespace=namespace,
+            max_files=config.max_output_files
+        )
+    
     def write(self, content: str, exist_ok: bool = False):
         """
         Write a new file with timestamp name.
@@ -447,7 +479,11 @@ class MessageHandler(SequenceFileHandler):
         max_retries: Union[int, Missing] = MISSING,
         wait_timeout: Union[float, Missing] = MISSING
     ) -> None:
-        SequenceFileHandler.__init__(self, namespace)
+        SequenceFileHandler.__init__(
+            self,
+            namespace=namespace,
+            max_files=config.max_message_files
+        )
         self.max_retries = (
             max_retries if 
             max_retries is not MISSING else 
@@ -495,7 +531,7 @@ class MessageHandler(SequenceFileHandler):
         until ``max_retries`` times. Return whether the message is successfully 
         received.
         """
-        if not self.check_namespace():
+        if not self.check_namespace(silent=False):
             return False
         
         attempt = 0
