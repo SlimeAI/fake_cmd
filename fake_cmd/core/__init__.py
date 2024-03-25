@@ -48,6 +48,13 @@ class ServerInfo(ReadonlyAttr):
         """
         os.makedirs(self.address, exist_ok=True)
         create_symbol(self.server_check_fp)
+        
+        for session_fname in filter(
+            lambda fname: fname.endswith(SESSION_ID_SUFFIX),
+            os.listdir(self.address)
+        ):
+            logger.info(f'Cleaning previous session cache: {session_fname}')
+            remove_dir_with_retry(self.concat_server_path(session_fname))
     
     def clear_server(self):
         """
