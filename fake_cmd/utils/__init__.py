@@ -15,10 +15,10 @@ class Config:
     
     def __init__(self) -> None:
         # Common polling interval
-        self.polling_interval: float = 0.1
+        self.polling_interval: float = 0.25
         # NOTE: The cmd is responsible for content output, 
         # so the polling interval should be short.
-        self.cmd_polling_interval: float = 0.01
+        self.cmd_polling_interval: float = 0.02
         # Read the subprocess pipe output within the timeout 
         # and return.
         # NOTE: This should be slightly larger than the 
