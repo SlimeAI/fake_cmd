@@ -56,7 +56,7 @@ class Config:
         self.heartbeat_max_interval: float = 20.0
         self.heartbeat_timeout: float = 600.0
         # The version info for compatibility check.
-        self.version: Tuple[int, int, int] = (0, 0, 3)
+        self.version: Tuple[int, int, int] = (0, 0, 4)
         # For system settings.
         self.platform: str = 'unix'
 
