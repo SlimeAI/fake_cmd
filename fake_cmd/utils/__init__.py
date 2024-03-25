@@ -40,15 +40,19 @@ class Config:
         self.cmd_pool_schedule_interval: float = 0.2
         # Server shutdown wait timeout.
         self.server_shutdown_wait_timeout: float = 5.0
-        # Common symbol wait timeout.
-        self.wait_timeout: float = 10.0
+        # Common symbol timeouts.
+        self.symbol_wait_timeout: float = 5.0
+        self.symbol_remove_timeout: float = 0.01
         # Retries
-        self.send_msg_retries: int = 3
+        self.msg_send_retries: int = 3
         self.msg_confirm_wait_timeout: float = 3.0
         self.exception_retries: int = 3
         self.exception_wait_timeout: float = 0.5
         # Heartbeat settings.
-        self.heartbeat_interval: float = 10.0
+        # Create or check symbol at a random interval between 
+        # min and max, in order to reduce file conflicts.
+        self.heartbeat_min_interval: float = 10.0
+        self.heartbeat_max_interval: float = 20.0
         self.heartbeat_timeout: float = 600.0
         # The version info for compatibility check.
         self.version: Tuple[int, int, int] = (0, 0, 3)
@@ -152,6 +156,9 @@ def parser_parse(
             raise
     return namespace
 
+#
+# Number comparison utils.
+#
 
 class GreaterThanAnything:
     """
@@ -162,3 +169,14 @@ class GreaterThanAnything:
     def __eq__(self, __value: Any) -> bool: return False
     def __gt__(self, __value: Any) -> bool: return True
     def __ge__(self, __value: Any) -> bool: return True
+
+
+class LessThanAnything:
+    """
+    Used for comparison.
+    """
+    def __lt__(self, __value: Any) -> bool: return True
+    def __le__(self, __value: Any) -> bool: return True
+    def __eq__(self, __value: Any) -> bool: return False
+    def __gt__(self, __value: Any) -> bool: return False
+    def __ge__(self, __value: Any) -> bool: return False

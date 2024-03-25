@@ -5,6 +5,7 @@ import os
 import json
 import time
 import uuid
+import random
 from itertools import filterfalse
 from threading import RLock
 from abc import ABC, abstractmethod, ABCMeta
@@ -31,7 +32,7 @@ from slime_core.utils.typing import (
     STOP
 )
 from .exception import retry_deco
-from . import polling, config, xor__
+from . import polling, config, xor__, LessThanAnything
 from .logging import logger
 from .file import (
     remove_file_with_retry,
@@ -487,7 +488,7 @@ class MessageHandler(SequenceFileHandler):
         self.max_retries = (
             max_retries if 
             max_retries is not MISSING else 
-            config.send_msg_retries
+            config.msg_send_retries
         )
         self.wait_timeout = (
             wait_timeout if 
@@ -622,7 +623,7 @@ def wait_symbol(
     ``wait_for_remove``: whether the function is used to wait for 
     removing the symbol or creating the symbol.
     """
-    timeout = config.wait_timeout if timeout is MISSING else timeout
+    timeout = config.symbol_wait_timeout if timeout is MISSING else timeout
     
     start = time.time()
     for _ in polling():
@@ -643,12 +644,16 @@ def remove_symbol(fp: str) -> None:
     """
     Remove a symbol file.
     """
+    if check_single_writer_lock(fp):
+        # If the file has a single writer lock, sleep a little 
+        # amount of time and then remove.
+        time.sleep(config.symbol_remove_timeout)
     remove_file_with_retry(fp)
 
 
 def check_symbol(fp: str) -> bool:
     """
-    Check if the symbol exists. Non-block form of ``wait_symbol``.
+    Check if the symbol exists. Non-blocking form of ``wait_symbol``.
     """
     if os.path.exists(fp):
         remove_symbol(fp)
@@ -689,47 +694,73 @@ class Connection(ABC):
 # Heartbeat services.
 #
 
-class Heartbeat:
+class Heartbeat(ReadonlyAttr):
     """
     Used heartbeat to confirm the connection is still alive.
     """
+    readonly_attr__ = (
+        'receive_fp',
+        'send_fp',
+        'min_interval',
+        'max_interval',
+        'timeout'
+    )
     
     def __init__(
         self,
         receive_fp: str,
         send_fp: str
     ) -> None:
-        self.receive_fp = receive_fp
-        self.last_receive = None
-        self.send_fp = send_fp
-        self.last_send = None
-        self.interval = config.heartbeat_interval
-        self.timeout = config.heartbeat_timeout
+        self.receive_fp: str = receive_fp
+        self.last_receive: Union[float, None] = None
+        self.send_fp: str = send_fp
+        # Initialized to ``LessThanAnything``.
+        self.last_beat: Union[float, LessThanAnything] = LessThanAnything()
+        self.min_interval: float = config.heartbeat_min_interval
+        self.max_interval: float = config.heartbeat_max_interval
+        self.timeout: float = config.heartbeat_timeout
+        self.set_interval()
     
     def beat(self) -> bool:
         now = time.time()
+        if self.last_receive is None:
+            # Set ``last_receive`` to now if it is None, because 
+            # if the heartbeat never receives and ``last_receive`` 
+            # is always None, we will never know when the timeout 
+            # reaches. Set here rather than in the ``__init__``, 
+            # because there may be a period of time between the 
+            # Heartbeat object creation and the first beat (although 
+            # most of the time it is short).
+            self.last_receive = now
+        
+        if self.last_beat > (now - self.interval):
+            # If within the interval, do not check and directly 
+            # return True.
+            return True
+        
+        create_symbol(self.send_fp)
         received = check_symbol(self.receive_fp)
-        if (
-            not received and 
-            self.last_receive is not None and 
-            (now - self.last_receive) > self.timeout
-        ):
+        if received:
+            self.last_receive = now
+        elif (now - self.last_receive) > self.timeout:
             logger.warning(
                 f'Heartbeat time out at {self.receive_fp}.'
             )
             return False
-        
-        if received:
-            self.last_receive = now
-        
-        if (
-            self.last_send is None or 
-            (now - self.last_send) >= self.interval
-        ):
-            create_symbol(self.send_fp)
-            self.last_send = now
-        
+
+        self.last_beat = now
+        # Set a new random interval after beat.
+        self.set_interval()
         return True
+    
+    def set_interval(self) -> float:
+        """
+        Set a random interval between min and max.
+        """
+        self.interval = random.uniform(
+            self.min_interval,
+            self.max_interval
+        )
 
 #
 # Stream bytes service.
