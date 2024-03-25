@@ -110,7 +110,10 @@ class Message(ReadonlyAttr):
         """
         Return the message send file name.
         """
-        return f'{str(self.timestamp)}{Message.send_fname_sep}{self.msg_id}.msg'
+        return (
+            f'{str(self.timestamp)}{Message.send_fname_sep}'
+            f'{self.msg_id}.msg'
+        )
     
     @property
     def output_namespace(self) -> str:
@@ -467,7 +470,10 @@ class OutputFileHandler(SequenceFileHandler):
         """
         # The order of output files strongly rely on the accurate time, 
         # so we use ``time.time_ns`` here.
-        return f'{time.time_ns()}{OutputFileHandler.fname_sep}{uuid_base36(uuid.uuid4().int)}.output'
+        return (
+            f'{time.time_ns()}{OutputFileHandler.fname_sep}'
+            f'{uuid_base36(uuid.uuid4().int)}.out'
+        )
 
 
 class MessageHandler(SequenceFileHandler):
