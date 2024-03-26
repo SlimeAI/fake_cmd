@@ -52,7 +52,8 @@ from fake_cmd.utils import (
     get_server_name,
     version_check,
     parser_parse,
-    uuid_base36
+    uuid_base36,
+    ArgNamespace
 )
 from fake_cmd.utils.logging import logger
 from . import SessionInfo, ActionFunc, dispatch_action, param_check, SESSION_ID_SUFFIX
@@ -214,7 +215,8 @@ def cli_action_version_check(
     return decorator
 
 
-CLIActionFunc = Callable[[Any, List[str]], Union["Command", Literal[False]]]
+CMDSplit = Tuple[Union[List[str], Missing], Union[str, Missing]]
+CLIActionFunc = Callable[[Any, CMDSplit], Union["Command", Literal[False]]]
 
 
 class CLI(
@@ -356,28 +358,37 @@ class CLI(
     # Command operations.
     #
     
-    def process_cmd(self, cmd: Union[str, None]) -> Union["Command", Literal[False]]:
+    def process_cmd(self, cmd_str: Union[str, None]) -> Union["Command", Literal[False]]:
         """
         Process the input cmd. Return a ``Command`` object if the cmd should 
         be executed in the server and it is successfully received, else return 
         ``False``.
         """
-        if not cmd:
+        if not cmd_str:
             return False
         
-        cmd_splits = shlex.split(cmd)
-        cli_func = self.cli_registry.get(cmd_splits[0], MISSING)
+        cmd_splits = split_cmd(cmd_str)
+        if not cmd_splits:
+            return False
+        
+        possible_options, _ = cmd_splits
+        if possible_options is MISSING:
+            cli_func = MISSING
+        else:
+            cli_func = self.cli_registry.get(possible_options[0], MISSING)
         if cli_func is MISSING:
-            # All the cmd_splits will be seen as part of the command.
+            # Parse default args.
             args = parser_parse(
                 parser=self.cmd_parser,
-                args=(['--'] + cmd_splits),
+                args=[],
                 strict=False
             )
             if args is MISSING:
                 return False
             
             set_cmd_args(args)
+            # The whole ``cmd_str`` will be seen as a command.
+            args.cmd = cmd_str
             return self.send_session_cmd(
                 content=self._make_cmd_content_through_args(args),
                 type='cmd'
@@ -466,45 +477,43 @@ class CLI(
     #
     
     @cli_registry(key='exit')
-    def cli_exit(self, cmd_splits: List[str]):
+    def cli_exit(self, cmd_splits: CMDSplit):
         raise CLITerminate
     
     @cli_registry(key='sid')
-    def cli_sid(self, cmd_splits: List[str]) -> Literal[False]:
+    def cli_sid(self, cmd_splits: CMDSplit) -> Literal[False]:
         print(
             f'Session id: {self.session_info.session_id}'
         )
         return False
     
     @cli_registry(key='help')
-    def cli_help(self, cmd_splits: List[str]) -> Literal[False]:
+    def cli_help(self, cmd_splits: CMDSplit) -> Literal[False]:
         print(CLIENT_HELP.strip('\n'))
         return False
     
     @cli_registry(key='ls-server-version')
-    def ls_server_version(self, cmd_splits: List[str]) -> Literal[False]:
+    def ls_server_version(self, cmd_splits: CMDSplit) -> Literal[False]:
         logger.info(
             f'Server version: {self.server_version}'
         )
         return False
     
     @cli_registry(key='version_strict_on')
-    def version_strict_on(self, cmd_splits: List[str]) -> Literal[False]:
+    def version_strict_on(self, cmd_splits: CMDSplit) -> Literal[False]:
         self.client.version_strict = True
         logger.info('Set ``version_strict`` to ``True``.')
         return False
     
     @cli_registry(key='version_strict_off')
-    def version_strict_off(self, cmd_splits: List[str]) -> Literal[False]:
+    def version_strict_off(self, cmd_splits: CMDSplit) -> Literal[False]:
         self.client.version_strict = False
         logger.info('Set ``version_strict`` to ``False``.')
         return False
     
     def _make_cmd_content_through_args(self, args) -> dict:
         return {
-            # NOTE: Not using shlex.join for compatibility 
-            # with Python 3.7
-            'cmd': ' '.join(args.cmd),
+            'cmd': args.cmd,
             'encoding': args.encoding,
             'stdin': args.stdin,
             'exec': args.exec,
@@ -513,18 +522,42 @@ class CLI(
             'kill_disabled': args.kill_disabled
         }
     
+    def _parse_cmd(
+        self,
+        cmd_splits: CMDSplit,
+        parser: argparse.ArgumentParser,
+        strict: bool
+    ) -> Union[ArgNamespace, Literal[False]]:
+        possible_options, possible_cmd = cmd_splits
+        if (
+            possible_options is MISSING or 
+            possible_cmd is MISSING
+        ):
+            return False
+        
+        args = parser_parse(
+            parser=parser,
+            args=possible_options[1:],
+            strict=strict
+        )
+        if args is MISSING:
+            return False
+        
+        args.cmd = possible_cmd
+        return args
+    
     @cli_registry(key='inter')
     @cli_action_version_check(min_version=(0, 0, 2))
-    def interactive_cmd(self, cmd_splits: List[str]) -> Union["Command", Literal[False]]:
+    def interactive_cmd(self, cmd_splits: CMDSplit) -> Union["Command", Literal[False]]:
         """
         Open command in an interactive mode.
         """
-        args = parser_parse(
+        args = self._parse_cmd(
+            cmd_splits=cmd_splits,
             parser=self.inter_cmd_parser,
-            args=cmd_splits[1:],
             strict=False
         )
-        if args is MISSING:
+        if not args:
             return False
         
         set_inter_cmd_args(args)
@@ -535,13 +568,13 @@ class CLI(
     
     @cli_registry(key='cmd')
     @cli_action_version_check(min_version=(0, 0, 2))
-    def escape_cmd(self, cmd_splits: List[str]) -> Union["Command", Literal[False]]:
-        args = parser_parse(
+    def escape_cmd(self, cmd_splits: CMDSplit) -> Union["Command", Literal[False]]:
+        args = self._parse_cmd(
+            cmd_splits=cmd_splits,
             parser=self.cmd_parser,
-            args=cmd_splits[1:],
             strict=False
         )
-        if args is MISSING:
+        if not args:
             return False
         
         set_cmd_args(args)
@@ -556,17 +589,21 @@ class CLI(
         'ls-cmd'
     ])
     @cli_action_version_check(min_version=(0, 0, 1))
-    def inner_cmd(self, cmd_splits: List[str]) -> Union["Command", Literal[False]]:
+    def inner_cmd(self, cmd_splits: CMDSplit) -> Union["Command", Literal[False]]:
+        possible_options, _ = cmd_splits
+        if possible_options is MISSING:
+            return False
         return self.send_session_cmd(
             content={
-                'cmd': cmd_splits[0],
-                'interactive': False
+                'cmd': possible_options[0],
+                'interactive': False,
+                'kill_disabled': False
             },
             type='inner_cmd'
         )
     
     @cli_registry(key='server_shutdown')
-    def server_shutdown(self, cmd_splits: List[str]) -> Literal[False]:
+    def server_shutdown(self, cmd_splits: CMDSplit) -> Literal[False]:
         try:
             confirm_key = 'YES'
             res = input(
@@ -1260,6 +1297,50 @@ class InteractiveInput(
 # Command argument parsers.
 #
 
+CMD_SEPARATOR = ' -- '
+
+def split_cmd(cmd_str: str) -> Union[CMDSplit, Literal[False]]:
+    """
+    Split the command str into possible command options and possible 
+    session command.
+    
+    Example:
+    ```Python
+    # (['inter'], 'python -i')
+    split_cmd('inter -- python -i')
+    # (['inter', '--stdin', 'pty'], MISSING<0x7fa1282a4310>)
+    split_cmd('inter --stdin pty')
+    # (['inter', '--exec', '/path/with white space', '--stdin', 'pty'], 'python -i')
+    split_cmd('inter --exec "/path/with white space" --stdin pty -- python -i')
+    # (MISSING<id>, 'a')
+    split_cmd(' -- a')
+    # (['a'], '')
+    split_cmd('a -- ')
+    # (MISSING<id>, '')
+    split_cmd(' -- ')
+    ```
+    """
+    cmd_splits = cmd_str.split(CMD_SEPARATOR, 1)
+    split_len = len(cmd_splits)
+    if split_len == 0:
+        return False
+    elif split_len > 2:
+        logger.warning(
+            'Expect the length of ``cmd_splits`` to be no more than 2, '
+            f'but {split_len} found. Split result: {cmd_splits}'
+        )
+        return False
+    
+    # Split the possible command options for further analyzing.
+    shlex_splits = shlex.split(cmd_splits[0])
+    if len(shlex_splits) == 0:
+        shlex_splits = MISSING
+    if split_len == 1:
+        return shlex_splits, MISSING
+    else:
+        return shlex_splits, cmd_splits[1]
+
+
 def _get_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -1294,7 +1375,6 @@ def _get_parser() -> argparse.ArgumentParser:
         ),
         choices=platform_open_registry.keys()
     )
-    parser.add_argument('cmd', nargs='*')
     return parser
 
 
@@ -1304,7 +1384,7 @@ def get_cmd_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def set_cmd_args(args: argparse.Namespace) -> None:
+def set_cmd_args(args: ArgNamespace) -> None:
     # Set other command arguments.
     args.interactive = False
     args.kill_disabled = False
@@ -1336,6 +1416,6 @@ def get_inter_cmd_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def set_inter_cmd_args(args: argparse.Namespace) -> None:
+def set_inter_cmd_args(args: ArgNamespace) -> None:
     # Set other interactive command arguments.
     args.interactive = True

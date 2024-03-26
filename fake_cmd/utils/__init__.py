@@ -137,21 +137,30 @@ def xor__(__x: Any, __y: Any) -> bool:
         (not __x and __y)
     )
 
+#
+# Argument Parsers
+#
+
+class ArgNamespace(Namespace):
+    
+    def __bool__(self) -> bool:
+        return True
+
 
 def parser_parse(
     parser: ArgumentParser,
     args: Union[Sequence[str], Missing, None] = MISSING,
     strict: bool = True
-) -> Union[Namespace, Missing]:
+) -> Union[ArgNamespace, Missing]:
     """
     Argument parse args.
     """
     namespace = MISSING
     try:
         if args is MISSING:
-            namespace = parser.parse_args()
+            namespace = parser.parse_args(namespace=ArgNamespace())
         else:
-            namespace = parser.parse_args(args=args)
+            namespace = parser.parse_args(args=args, namespace=ArgNamespace())
     except SystemExit:
         if strict:
             raise
