@@ -85,7 +85,7 @@ Help Document [fake_cmd]:
 >>> ``version_strict_off``: Set the version strict to False.
 
 2. Advanced Running:
-=> Required Syntax: [Command options (as follows)] {CMD_SEPARATOR} [Your real command]
+=> Required Syntax: [Command options (as follows)]{CMD_SEPARATOR}[Your real command]
 => Example: inter --exec /bin/bash -- python -i
 (In the above example, ``inter --exec /bin/bash`` is the command options, and ``python -i`` 
 is your real command to run on the server)
