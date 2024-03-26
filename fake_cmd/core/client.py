@@ -64,9 +64,14 @@ CMD_INTERRUPT = 1
 CMD_TERMINATE = 2
 CMD_KILL = 3
 CMD_BACKGROUND = 4
+# Separator to separate between command options and session command.
+CMD_SEPARATOR = ' -- '
+# Document Separator length
+DOC_SEP_LEN = 50
 
 CLIENT_HELP = f"""
-NOTE: ``Ctrl+C`` won't start a new line. Use ``Ctrl+C`` and ``enter`` instead.
+{'=' * DOC_SEP_LEN}
+Help Document [fake_cmd]:
 
 1. Inner Commands:
 >>> ``help``: Get the help document.
@@ -80,6 +85,11 @@ NOTE: ``Ctrl+C`` won't start a new line. Use ``Ctrl+C`` and ``enter`` instead.
 >>> ``version_strict_off``: Set the version strict to False.
 
 2. Advanced Running:
+=> Required Syntax: [Command options (as follows)] {CMD_SEPARATOR} [Your real command]
+=> Example: inter --exec /bin/bash -- python -i
+(In the above example, ``inter --exec /bin/bash`` is the command options, and ``python -i`` 
+is your real command to run on the server)
+=> Supported command options:
 >>> ``cmd``: Run the command with advanced options. Use ``cmd -h`` to get more help.
 >>> ``inter``: Run the command in the interactive mode. Input is enabled, and if you \
 want to quit, use both ``Ctrl+C`` (to terminate the command) and ``Ctrl+D`` (to \
@@ -100,6 +110,7 @@ mode, and use ``exit`` in the /bin/bash, etc.).
 
 4. Danger Zone:
 >>> ``server_shutdown``: Shutdown the whole server. BE CAREFUL TO USE IT!!!
+{'=' * DOC_SEP_LEN}
 """
 
 
@@ -1297,8 +1308,6 @@ class InteractiveInput(
 # Command argument parsers.
 #
 
-CMD_SEPARATOR = ' -- '
-
 def split_cmd(cmd_str: str) -> Union[CMDSplit, Literal[False]]:
     """
     Split the command str into possible command options and possible 
@@ -1332,7 +1341,7 @@ def split_cmd(cmd_str: str) -> Union[CMDSplit, Literal[False]]:
         return False
     
     # Split the possible command options for further analyzing.
-    shlex_splits = shlex.split(cmd_splits[0])
+    shlex_splits = shlex.split(cmd_splits[0], posix=config.posix_shlex)
     if len(shlex_splits) == 0:
         shlex_splits = MISSING
     if split_len == 1:

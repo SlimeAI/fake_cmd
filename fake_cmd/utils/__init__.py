@@ -59,6 +59,7 @@ class Config:
         self.version: Tuple[int, int, int] = (0, 0, 4)
         # For system settings.
         self.platform: str = 'unix'
+        self.posix_shlex: bool = True
 
 
 config = Config()
