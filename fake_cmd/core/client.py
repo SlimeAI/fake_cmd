@@ -502,6 +502,13 @@ class CLI(
         )
         return False
     
+    @cli_registry(key='ls-client-version')
+    def ls_server_version(self, cmd_splits: CMDSplit) -> Literal[False]:
+        logger.info(
+            f'Client version: {config.version}'
+        )
+        return False
+    
     @cli_registry(key='version_strict_on')
     def version_strict_on(self, cmd_splits: CMDSplit) -> Literal[False]:
         self.client.version_strict = True
@@ -547,6 +554,22 @@ class CLI(
         return self.send_session_cmd(
             content=cmd_parser.make_cmd_content(args),
             type='cmd'
+        )
+    
+    @cli_registry(key='pexpect')
+    @cli_action_version_check(min_version=(0, 0, 5))
+    def pexpect_cmd(self, cmd_splits: CMDSplit) -> Union["ClientCommand", Literal[False]]:
+        cmd_parser = cmd_parser_registry.get('pexpect')()
+        args = cmd_parser.parse_cmd(
+            cmd_splits=cmd_splits,
+            strict=False
+        )
+        if not args:
+            return False
+        
+        return self.send_session_cmd(
+            content=cmd_parser.make_cmd_content(args),
+            type='pexpect_cmd'
         )
     
     @cli_registry.register_multi([

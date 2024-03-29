@@ -45,13 +45,29 @@ from fake_cmd.utils import (
     config,
     timestamp_to_str
 )
-from fake_cmd.utils.executors import Executor, platform_open_executor_registry, DefaultPopenExecutor
-from fake_cmd.utils.executors.reader import PopenReader, popen_reader_registry, PipePopenReader
+from fake_cmd.utils.executors import (
+    Executor,
+    platform_open_executor_registry,
+    DefaultPopenExecutor,
+    pexpect_executor_registry,
+    PexpectExecutor
+)
+from fake_cmd.utils.executors.reader import (
+    PopenReader,
+    popen_reader_registry,
+    PipePopenReader,
+    pexpect_reader_registry,
+    DefaultPexpectReader,
+    PexpectReader
+)
 from fake_cmd.utils.executors.writer import PopenWriter, popen_writer_registry
 from fake_cmd.utils.exception import ServerShutdown, ignore_keyboard_interrupt
 from fake_cmd.utils.logging import logger
 from . import ServerInfo, SessionInfo, dispatch_action, ActionFunc, param_check
 
+#
+# States
+#
 
 class SessionState(ReadonlyAttr):
     
@@ -125,6 +141,9 @@ class CommandState(ReadonlyAttr):
             )
         )
 
+#
+# Server
+#
 
 class Server(
     LifecycleRun,
@@ -272,6 +291,9 @@ class Server(
                 f'Missing args: {res}'
             )
 
+#
+# Session
+#
 
 class Session(
     LifecycleRun,
@@ -400,11 +422,34 @@ class Session(
         'platform', 'kill_disabled', 'interactive'
     ))
     def run_new_cmd(self, msg: Message):
+        """
+        Run a new Popen command.
+        """
         def terminate_command_func(*args):
             self.cmd_pool.cancel(cmd)
             self.reset_running_cmd()
         
         cmd = PopenShellCommand(
+            session=self,
+            msg=msg,
+            exit_callbacks=[terminate_command_func]
+        )
+        self.set_running_cmd(cmd)
+        self.cmd_pool.submit(cmd)
+    
+    @action_registry(key='pexpect_cmd')
+    @param_check(required=[
+        'cmd', 'encoding', 'reader', 'kill_disabled', 'interactive'
+    ])
+    def run_pexpect_cmd(self, msg: Message):
+        """
+        Run a new pexpect command.
+        """
+        def terminate_command_func(*args):
+            self.cmd_pool.cancel(cmd)
+            self.reset_running_cmd()
+        
+        cmd = PexpectShellCommand(
             session=self,
             msg=msg,
             exit_callbacks=[terminate_command_func]
@@ -724,6 +769,9 @@ class Session(
                     )
                 )
 
+#
+# Commands
+#
 
 class SessionCommand(
     LifecycleRun,
@@ -906,6 +954,26 @@ class SessionCommand(
 
 class ShellCommand(SessionCommand):
     
+    def __init__(
+        self,
+        session: Session,
+        msg: Message,
+        exit_callbacks: Union[Iterable[ExitCallbackFunc], None] = None,
+        executor: Union[Executor, Nothing] = NOTHING
+    ):
+        SessionCommand.__init__(
+            self,
+            session=session,
+            msg=msg,
+            exit_callbacks=exit_callbacks,
+            executor=executor
+        )
+        # NOTE: This should be called after the Message object has been converted to 
+        # a CommandMessage object in SessionCommand.
+        if self.msg.kill_disabled:
+            # Set kill disabled.
+            self.cmd_state.kill_disabled.set()
+    
     def running(self) -> None:
         # Start the command exec.
         executor = self.executor
@@ -1034,15 +1102,33 @@ class PopenShellCommand(ShellCommand):
             exit_callbacks=exit_callbacks,
             executor=executor
         )
-        # NOTE: This should be called after the Message object has been converted to 
-        # a CommandMessage object in SessionCommand.
-        if self.msg.kill_disabled:
-            # Set kill disabled.
-            self.cmd_state.kill_disabled.set()
 
 
 class PexpectShellCommand(ShellCommand):
-    pass
+    
+    def __init__(
+        self,
+        session: Session,
+        msg: Message,
+        exit_callbacks: Union[Iterable[ExitCallbackFunc], None] = None
+    ):
+        content: dict = msg.content
+        reader: PexpectReader = pexpect_reader_registry.get(content['reader'], DefaultPexpectReader)()
+        encoding: str = content['encoding'] or config.cmd_pipe_encoding
+        executor = pexpect_executor_registry.get('default', PexpectExecutor)(
+            pexpect_params=FuncParams(
+                content['cmd']
+            ),
+            reader=reader,
+            encoding=encoding
+        )
+        ShellCommand.__init__(
+            self,
+            session=session,
+            msg=msg,
+            exit_callbacks=exit_callbacks,
+            executor=executor
+        )
 
 
 class InnerCommand(SessionCommand):

@@ -1,3 +1,4 @@
+import re
 import time
 import selectors
 import subprocess
@@ -10,7 +11,7 @@ from slime_core.utils.typing import (
     MISSING
 )
 from fake_cmd.utils.logging import logger
-from . import ExecutorComponent, PlatformPopenExecutor
+from . import ExecutorComponent, PlatformPopenExecutor, PexpectExecutor
 
 #
 # Stream bytes service.
@@ -107,6 +108,12 @@ class PopenReader(ExecutorComponent[PlatformPopenExecutor]):
         """
         return ''
     
+    def readable(self) -> bool:
+        """
+        Return whether the reader is readable. Default to True.
+        """
+        return True
+    
     def get_popen_stdout(self):
         """
         Get the stdout argument passed to ``Popen``.
@@ -192,6 +199,101 @@ class PipePopenReader(PopenReader):
 # Pexpect Readers
 #
 
-class PexpectReader(ExecutorComponent):
-    pass
+pexpect_reader_registry = Registry[Type["PexpectReader"]]('pexpect_reader_registry')
 
+
+class PexpectReader(ExecutorComponent[PexpectExecutor]):
+    # NOTE: Unlike subprocess.Popen, which can specify the stdout and stderr to be 
+    # None to redirect the output of the subprocess to the standard stream of the 
+    # parent process, ``pexpect`` uses pty.fork to redirect the output to a file, 
+    # which means we should always read the content to avoid the pipe piling up and 
+    # causing deadlock, so the pexpect_reader_registry does not provide the 'none' 
+    # option (which reads nothing in this mode) as ``PopenReader`` does.
+    
+    readonly_attr__ = ('bytes_parser',)
+    
+    def __init__(self) -> None:
+        ExecutorComponent.__init__(self)
+    
+    @property
+    def encoding(self) -> str:
+        return self.executor.encoding
+    
+    def bind(self, executor: PexpectExecutor) -> None:
+        super().bind(executor)
+        # The encoding attribute will be available after binding, so the 
+        # ``bytes_parser`` object should be created here.
+        self.bytes_parser = StreamBytesParser(encoding=self.encoding)
+    
+    def read(self, timeout: float) -> str:
+        """
+        Read the content within the timeout.
+        """
+        return ''
+    
+    def read_all(self) -> str:
+        """
+        Read all the content util file end. Make sure the 
+        process is end when you call ``read_all``, else the 
+        read will be blocked.
+        """
+        return ''
+    
+    def readable(self) -> bool:
+        """
+        Return whether the reader is readable. Default to True.
+        """
+        return True
+    
+    def parse_content(self, content: Union[str, bytes, None]) -> str:
+        """
+        Parse the content to str according to different content types.
+        """
+        if isinstance(content, bytes):
+            return self.bytes_parser.parse(content)
+        elif isinstance(content, str):
+            return content
+        elif content is None:
+            return ''
+        else:
+            logger.warning(
+                f'Unsupported type found: {type(content)}'
+            )
+            return ''
+
+
+@pexpect_reader_registry(key='default')
+class DefaultPexpectReader(PexpectReader):
+    
+    def read(self, timeout: float) -> str:
+        start = time.time()
+        content = ''
+        while True:
+            content += self._read_one()
+            stop = time.time()
+            if (stop - start) > timeout:
+                break
+        return content
+    
+    def read_all(self) -> str:
+        process = self.executor.process
+        content = process.read()
+        return self.parse_content(content)
+    
+    def _read_one(self) -> str:
+        """
+        Read one char (if available).
+        """
+        import pexpect
+        process = self.executor.process
+        index = process.expect([
+            # Expect any char.
+            re.compile('.{1}'.encode(self.encoding), re.DOTALL),
+            process.delimiter,
+            pexpect.TIMEOUT
+        ], timeout=0)
+        if index == 0:
+            content = process.after
+        else:
+            content = process.before
+        return self.parse_content(content)

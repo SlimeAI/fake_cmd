@@ -19,7 +19,7 @@ from . import config, ArgNamespace, parser_parse
 from .logging import logger
 from .executors import platform_open_executor_registry
 from .executors.writer import popen_writer_registry
-from .executors.reader import popen_reader_registry
+from .executors.reader import popen_reader_registry, pexpect_reader_registry
 
 #
 # Split command for further analysis.
@@ -202,7 +202,9 @@ class PopenCMDParser(CMDParser):
             'exec': args.exec,
             'platform': args.platform,
             'interactive': args.interactive,
-            'kill_disabled': args.kill_disabled
+            'kill_disabled': args.kill_disabled,
+            # Add 'stdin' content for backward compatibility.
+            'stdin': args.writer
         }
 
 
@@ -249,3 +251,51 @@ class InterPopenParser(PopenCMDParser):
 
     def set_additional_args(self, args: ArgNamespace) -> None:
         args.interactive = True
+
+
+@cmd_parser_registry(key='pexpect')
+class PexpectParser(CMDParser):
+    
+    def get_parser(self) -> ArgumentParser:
+        parser = ArgumentParser(prog='pexpect')
+        parser.add_argument(
+            '--reader',
+            default='default',
+            type=str,
+            choices=pexpect_reader_registry.keys(),
+            required=False,
+            help=(
+                'The output redirection setting. Specify the reader '
+                'setting of pexpect.'
+            )
+        )
+        parser.add_argument(
+            '--encoding',
+            default=None,
+            type=str,
+            required=False,
+            help=(
+                'The encoding method of input and output. Should not '
+                'be specified most of the time (and leave it default).'
+            )
+        )
+        parser.add_argument(
+            '--kill_disabled',
+            action='store_true',
+            help=(
+                'Whether keyboard interrupt is disabled to kill the command.'
+            )
+        )
+        return parser
+    
+    def set_additional_args(self, args: ArgNamespace) -> None:
+        args.interactive = True
+    
+    def make_cmd_content(self, args: ArgNamespace) -> dict:
+        return {
+            'cmd': args.cmd,
+            'encoding': args.encoding,
+            'reader': args.reader,
+            'interactive': args.interactive,
+            'kill_disabled': args.kill_disabled
+        }

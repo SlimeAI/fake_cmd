@@ -23,8 +23,9 @@ from slime_core.utils.typing import (
     TYPE_CHECKING
 )
 from fake_cmd.utils import config, polling
+from fake_cmd.utils.logging import logger
 if TYPE_CHECKING:
-    from .reader import PopenReader
+    from .reader import PopenReader, PexpectReader
     from .writer import PopenWriter
 
 
@@ -57,7 +58,7 @@ class Executor(
         return self.process is not MISSING
     
     @abstractmethod
-    def start(self):
+    def start(self) -> None:
         """
         Start a command exec (through subprocess.Popen, pexpect.spawn, 
         etc.).
@@ -120,7 +121,7 @@ class Executor(
         """
         pass
     
-    def sighup(self):
+    def sighup(self) -> None:
         """
         Send sighup signal to the process. This is optionally implemented, 
         and is not used by the fake_cmd in the current version.
@@ -128,21 +129,21 @@ class Executor(
         pass
     
     @abstractmethod
-    def keyboard_interrupt(self):
+    def keyboard_interrupt(self) -> None:
         """
         Send keyboard interrupt to the process.
         """
         pass
     
     @abstractmethod
-    def terminate(self):
+    def terminate(self) -> None:
         """
         Terminate the process.
         """
         pass
     
     @abstractmethod
-    def kill(self):
+    def kill(self) -> None:
         """
         Kill the process.
         """
@@ -245,7 +246,7 @@ class PlatformPopenExecutor(Executor):
     def returncode(self):
         return self.process.returncode
     
-    def start(self):
+    def start(self) -> None:
         popen_params = self.popen_params
         self.process: Union[Missing, Popen] = Popen(*popen_params.args, **popen_params.kwargs)
         # Call read_init here.
@@ -258,7 +259,7 @@ class PlatformPopenExecutor(Executor):
         return self.reader.read_all()
     
     def readable(self) -> bool:
-        return True
+        return self.reader.readable()
     
     def write(self, content: str) -> bool:
         return self.writer.write(content)
@@ -274,29 +275,20 @@ class PlatformPopenExecutor(Executor):
     def close_write(self) -> None:
         self.writer.close()
     
-    def keyboard_interrupt(self):
-        """
-        Send keyboard interrupt.
-        """
+    def keyboard_interrupt(self) -> None:
         self.send_signal(signal.SIGINT)
     
-    def terminate(self):
-        """
-        Terminate the process.
-        """
+    def terminate(self) -> None:
         self.send_signal(signal.SIGTERM)
     
-    def kill(self):
-        """
-        Kill the process.
-        """
+    def kill(self) -> None:
         if hasattr(signal, 'SIGKILL'):
             self.send_signal(signal.SIGKILL)
         else:
             self.terminate()
     
     @abstractmethod
-    def send_signal(self, sig):
+    def send_signal(self, sig) -> None:
         """
         Send signal to the process.
         """
@@ -320,7 +312,7 @@ platform_open_executor_registry = Registry[Type[PlatformPopenExecutor]]('platfor
 @platform_open_executor_registry(key='default')
 class DefaultPopenExecutor(PlatformPopenExecutor):
     
-    def send_signal(self, sig):
+    def send_signal(self, sig) -> None:
         """
         Safely send signal according to subprocess.Popen.send_signal.
         """
@@ -360,7 +352,7 @@ class UnixPopenExecutor(PlatformPopenExecutor):
             encoding=encoding
         )
 
-    def send_signal(self, sig):
+    def send_signal(self, sig) -> None:
         """
         Safely send signal according to subprocess.Popen.send_signal.
         """
@@ -383,6 +375,89 @@ class UnixPopenExecutor(PlatformPopenExecutor):
 # Pexpect Executor
 #
 
-class PexpectExecutor(Executor):
-    pass
+pexpect_executor_registry = Registry[Type["PexpectExecutor"]]('pexpect_executor_registry')
 
+
+@pexpect_executor_registry(key='default')
+class PexpectExecutor(Executor):
+    """
+    Executor using pexpect.
+    
+    Availability: Unix.
+    """
+    readonly_attr__ = (
+        'reader',
+        'encoding'
+    )
+    
+    def __init__(
+        self,
+        pexpect_params: FuncParams,
+        reader: "PexpectReader",
+        encoding: Union[str, None] = None
+    ) -> None:
+        Executor.__init__(self)
+        self.pexpect_params = pexpect_params
+        self.reader = reader
+        self.encoding = encoding or config.cmd_pipe_encoding
+        # Bind Reader.
+        self.reader.bind(self)
+    
+    def start(self) -> None:
+        from pexpect import spawn
+        self.process: Union[Missing, spawn] = spawn(
+            *self.pexpect_params.args,
+            **self.pexpect_params.kwargs
+        )
+    
+    def read(self, timeout: float) -> str:
+        return self.reader.read(timeout)
+    
+    def read_all(self) -> str:
+        return self.reader.read_all()
+    
+    def readable(self) -> bool:
+        return True
+    
+    def write(self, content: str) -> bool:
+        try:
+            self.process.send(content.encode(self.encoding))
+        except Exception as e:
+            logger.error(str(e), stack_info=True)
+            return False
+        else:
+            return True
+    
+    def write_line(self, content: str) -> bool:
+        try:
+            self.process.sendline(content.encode(self.encoding))
+        except Exception as e:
+            logger.error(str(e), stack_info=True)
+            return False
+        else:
+            return True
+    
+    def writable(self) -> bool:
+        return True
+    
+    def keyboard_interrupt(self) -> None:
+        self.process.kill(signal.SIGINT)
+    
+    def terminate(self) -> None:
+        self.process.kill(signal.SIGTERM)
+    
+    def kill(self) -> None:
+        if hasattr(signal, 'SIGKILL'):
+            self.process.kill(signal.SIGKILL)
+        else:
+            self.terminate()
+    
+    def is_running(self) -> bool:
+        return (
+            self.is_started() and 
+            self.process.isalive()
+        )
+    
+    def __exit__(self, *args, **kwargs):
+        self.process.close()
+        return super().__exit__(*args, **kwargs)
