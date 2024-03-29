@@ -116,7 +116,7 @@ class CMDParser(ABC):
             return args
         # Set additional args.
         self.set_additional_args(args)
-        return args
+        return self.check_args(args)
     
     def parse_cmd(
         self,
@@ -138,6 +138,13 @@ class CMDParser(ABC):
             return False
         
         args.cmd = possible_cmd
+        return args
+    
+    def check_args(self, args: ArgNamespace) -> Union[ArgNamespace, Missing]:
+        """
+        Check whether the args are compatible, and return ``MISSING`` if 
+        they are not.
+        """
         return args
 
 
@@ -229,12 +236,16 @@ class InterPopenParser(PopenCMDParser):
     def get_parser(self) -> ArgumentParser:
         parser = super().get_parser()
         parser.prog = 'inter'
-         # Set the default to 'pipe'.
+        # NOTE: ``default`` is an excluded option in the interactive mode because it 
+        # is not writable through fake_cmd.
+        excluded_writers = set(['default'])
+        writer_choices = set(popen_writer_registry.keys()).difference(excluded_writers)
         parser.add_argument(
             '--writer',
+            # Set the default to 'pipe'.
             default='pipe',
             type=str,
-            choices=popen_writer_registry.keys(),
+            choices=writer_choices,
             required=False,
             help=(
                 'The interactive input setting. Specify the writer '
@@ -245,13 +256,37 @@ class InterPopenParser(PopenCMDParser):
             '--kill_disabled',
             action='store_true',
             help=(
-                'Whether keyboard interrupt is disabled to kill the command.'
+                'Whether keyboard interrupt is disabled to kill the command. NOTE: This '
+                'option is not encouraged in ``inter``. If you are running the server on '
+                'a unix system, installing and using ``pexpect`` is recommended.'
             )
         )
         return parser
 
     def set_additional_args(self, args: ArgNamespace) -> None:
         args.interactive = True
+    
+    def check_args(self, args: ArgNamespace) -> Union[ArgNamespace, Missing]:
+        args = super().check_args(args)
+        if args is MISSING:
+            return args
+        if args.kill_disabled:
+            # NOTE: ``kill_disabled`` is not an encouraged option 
+            # in the ``inter`` running mode.
+            if args.writer in ('pty',):
+                logger.warning(
+                    f'``kill_disabled`` is not supported when --writer is ``{args.writer}``.'
+                )
+                return MISSING
+            logger.warning(
+                'You are setting ``kill_disabled`` to True in the interactive mode, and this '
+                'is not perfectly supported. For example, the command may not be successfully '
+                'terminated if you open a /bin/bash shell console and run a command in it. '
+                'If you are starting the server on a Unix system, install and use ``pexpect`` '
+                'instead to get better user experience.'
+            )
+        # Check passed.
+        return args
 
 
 @cmd_parser_registry(key='pexpect')

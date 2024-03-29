@@ -363,14 +363,11 @@ class Session(
     
     def running(self):
         # Send the server version.
-        self.client_writer.write(
-            Message(
-                session_id=self.session_id,
-                type='server_version',
-                content={
-                    'version': list(config.version)
-                }
-            )
+        self.send_msg_to_client(
+            type='server_version',
+            content={
+                'version': list(config.version)
+            }
         )
         
         # Start the session listening.
@@ -505,33 +502,19 @@ class Session(
             
             executor = running_cmd.executor
             if not executor.writable():
-                self.client_writer.write(
-                    Message(
-                        session_id=self.session_id,
-                        type='info',
-                        content={
-                            'info': (
-                                f'Current cmd {str(running_cmd)} '
-                                'does not accept input.'
-                            )
-                        }
-                    )
-                )
+                self.info_client(f'Input failed: Current cmd {str(running_cmd)} does not accept input.')
                 return
+            if not executor.is_started():
+                self.info_client(f'Input failed: Command {str(running_cmd)} has not started yet.')
+                return
+            if not executor.is_running():
+                self.info_client(f'Input failed: Command {str(running_cmd)} is not running.')
+                return
+            
             # Write to the cmd.
             res = executor.write_line(input_str)
             if not res:
-                self.client_writer.write(
-                    Message(
-                        session_id=self.session_id,
-                        type='info',
-                        content={
-                            'info': (
-                                f'Interactive input failed: "{input_str}".'
-                            )
-                        }
-                    )
-                )
+                self.info_client(f'Interactive input failed: "{input_str}".')
     
     def running_cmd_check(self, cmd_id: str) -> Union["SessionCommand", Literal[False]]:
         """
@@ -557,18 +540,10 @@ class Session(
         """
         Notify the command id inconsistency.
         """
-        self.client_writer.write(
-            Message(
-                session_id=self.session_id,
-                type='info',
-                content={
-                    'info': (
-                        f'Command running inconsistency occurred. '
-                        f'Requiring from client: {incoming_cmd_id}. Actual running: '
-                        f'{running_cmd.cmd_id}'
-                    )
-                }
-            )
+        self.info_client(
+            f'Command running inconsistency occurred. '
+            f'Requiring from client: {incoming_cmd_id}. Actual running: '
+            f'{running_cmd.cmd_id}'
         )
     
     #
@@ -632,18 +607,10 @@ class Session(
             ):
                 # One command is running or has not been terminated, but 
                 # another command received.
-                self.client_writer.write(
-                    Message(
-                        session_id=self.session_id,
-                        type='info',
-                        content={
-                            'info': (
-                                'Another command is running or has not been '
-                                'terminated, inconsistency occurred. Use ``ls-cmd`` '
-                                'to check it.'
-                            )
-                        }
-                    )
+                self.info_client(
+                    'Another command is running or has not been '
+                    'terminated, inconsistency occurred. Use ``ls-cmd`` '
+                    'to check it.'
                 )
             self.running_cmd = running_cmd
     
@@ -746,27 +713,38 @@ class Session(
             logger.warning(
                 f'Missing args: {res}'
             )
-            self.client_writer.write(
-                Message(
-                    session_id=self.session_id,
-                    type='info',
-                    content={
-                        'info': f'Server action missing args: {res}'
-                    }
-                )
-            )
+            self.info_client(f'Server action missing args: {res}')
             if msg.type in ('cmd', 'inner_cmd'):
                 # Notify that the command has terminated.
-                self.client_writer.write(
-                    Message(
-                        session_id=self.session_id,
-                        type='cmd_quit',
-                        content={
-                            'cmd_id': msg.msg_id,
-                            'type': 'remote'
-                        }
-                    )
+                self.send_msg_to_client(
+                    type='cmd_quit',
+                    content={
+                        'cmd_id': msg.msg_id,
+                        'type': 'remote'
+                    }
                 )
+    
+    #
+    # Message sending wrappers.
+    #
+    
+    def send_msg_to_client(self, type: str, content: Union[dict, None] = None) -> bool:
+        """
+        Send message to the corresponding client.
+        """
+        self.client_writer.write(
+            Message(
+                session_id=self.session_id,
+                type=type,
+                content=content
+            )
+        )
+    
+    def info_client(self, info: str) -> bool:
+        """
+        Send ``info`` message to the client.
+        """
+        return self.send_msg_to_client(type='info', content={'info': info})
 
 #
 # Commands
@@ -778,6 +756,9 @@ class SessionCommand(
     ReadonlyAttr,
     metaclass=Metaclasses(ABCMeta, _ReadonlyAttrMetaclass)
 ):
+    """
+    Start running a new command in the session.
+    """
     readonly_attr__ = (
         'session',
         'msg',
@@ -818,6 +799,14 @@ class SessionCommand(
     def client_writer(self) -> MessageHandler:
         return self.session.client_writer
     
+    @property
+    def send_msg_to_client(self):
+        return self.session.send_msg_to_client
+    
+    @property
+    def info_client(self):
+        return self.session.info_client
+    
     #
     # Running operations.
     #
@@ -842,26 +831,20 @@ class SessionCommand(
                 session_info.command_terminate_confirm_fp(self.msg)
             )
         elif cmd_state.terminate_local.is_set():
-            self.client_writer.write(
-                Message(
-                    session_id=session_info.session_id,
-                    type='cmd_quit',
-                    content={
-                        'cmd_id': self.cmd_id,
-                        'type': 'remote'
-                    }
-                )
+            self.send_msg_to_client(
+                type='cmd_quit',
+                content={
+                    'cmd_id': self.cmd_id,
+                    'type': 'remote'
+                }
             )
         elif cmd_state.finished.is_set():
-            self.client_writer.write(
-                Message(
-                    session_id=session_info.session_id,
-                    type='cmd_quit',
-                    content={
-                        'cmd_id': self.cmd_id,
-                        'type': 'finish'
-                    }
-                )
+            self.send_msg_to_client(
+                type='cmd_quit',
+                content={
+                    'cmd_id': self.cmd_id,
+                    'type': 'finish'
+                }
             )
         elif cmd_state.terminate_disconnect.is_set():
             # Doing nothing because the disconnect operations 
@@ -873,28 +856,17 @@ class SessionCommand(
             __exc_value or 
             __traceback
         ):
-            self.client_writer.write(
-                Message(
-                    session_id=self.session_info.session_id,
-                    type='info',
-                    content={
-                        'info': (
-                            f'Command terminated with exception: {str(__exc_type)} - '
-                            f'{str(__exc_value)}. Command content: {self.msg.content}. '
-                            f'Command id: {self.cmd_id}.'
-                        )
-                    }
-                )
+            self.info_client(
+                f'Command terminated with exception: {str(__exc_type)} - '
+                f'{str(__exc_value)}. Command content: {self.msg.content}. '
+                f'Command id: {self.cmd_id}.'
             )
-            self.client_writer.write(
-                Message(
-                    session_id=self.session_info.session_id,
-                    type='cmd_quit',
-                    content={
-                        'cmd_id': self.cmd_id,
-                        'type': 'remote'
-                    }
-                )
+            self.send_msg_to_client(
+                type='cmd_quit',
+                content={
+                    'cmd_id': self.cmd_id,
+                    'type': 'remote'
+                }
             )
         # Mark the command exits.
         cmd_state.exit.set()
@@ -909,30 +881,14 @@ class SessionCommand(
         """
         if self.cmd_state.queued.is_set():
             # Notify only when it is queued.
-            self.client_writer.write(
-                Message(
-                    session_id=self.session_info.session_id,
-                    type='info',
-                    content={
-                        'info': f'Command {self.msg.cmd_id} running...'
-                    }
-                )
-            )
+            self.info_client(f'Command "{self.msg.cmd_id}" running...')
     
     def info_queued(self):
         """
         Notify the client that the command is queued.
         """
         if self.cmd_state.queued.is_set():
-            self.client_writer.write(
-                Message(
-                    session_id=self.session_info.session_id,
-                    type='info',
-                    content={
-                        'info': f'Command {self.msg.cmd_id} being queued...'
-                    }
-                )
-            )
+            self.info_client(f'Command "{self.msg.cmd_id}" being queued...')
     
     #
     # Other methods.
@@ -952,6 +908,9 @@ class SessionCommand(
 
 
 class ShellCommand(SessionCommand):
+    """
+    Start a new shell command.
+    """
     
     def __init__(
         self,
@@ -1065,6 +1024,9 @@ class ShellCommand(SessionCommand):
 
 
 class PopenShellCommand(ShellCommand):
+    """
+    Start a new shell command using Popen.
+    """
     
     def __init__(
         self,
@@ -1104,6 +1066,9 @@ class PopenShellCommand(ShellCommand):
 
 
 class PexpectShellCommand(ShellCommand):
+    """
+    Start a new shell command using pexpect.
+    """
     
     def __init__(
         self,
@@ -1131,6 +1096,9 @@ class PexpectShellCommand(ShellCommand):
 
 
 class InnerCommand(SessionCommand):
+    """
+    Start an Inner Command.
+    """
     
     inner_cmd_registry = Registry[Callable[[Any], None]]('inner_cmd_registry')
     

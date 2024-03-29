@@ -105,6 +105,11 @@ class PtyPopenWriter(PopenWriter):
     Write input through pty master and slave.
     
     Availability: Unix.
+    
+    NOTE: The popen writer using ``pty.openpty`` is not an encouraged 
+    behavior, and if ``kill_disabled`` is set to True in the interactive 
+    mode, the PtyWriter may cause the process unable to quit because of the 
+    unclosed master and slave files. Using ``pexpect`` is encouraged.
     """
     readonly_attr__ = (
         'master',

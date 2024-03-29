@@ -82,13 +82,14 @@ Help Document [fake_cmd]:
 2. Advanced Running:
 => Required Syntax: [Command options (as follows)]{CMD_SEPARATOR}[Your real command]
 => Example: inter --exec /bin/bash -- python -i
-(In the above example, ``inter --exec /bin/bash`` is the command options, and ``python -i`` 
+(In the above example, ``inter --exec /bin/bash`` is the command options, and ``python -i`` \
 is your real command to run on the server)
 => Supported command options:
 >>> ``cmd``: Run the command with advanced options. Use ``cmd -h`` to get more help.
->>> ``inter``: Run the command in the interactive mode. Input is enabled, and if you \
-want to quit, use both ``Ctrl+C`` (to terminate the command) and ``Ctrl+D`` (to \
-quit the interactive input). Use ``inter -h`` to get more help.
+>>> ``inter``: Run the command in the interactive mode. Input is enabled. Use \
+``inter -h`` to get more help.
+>>> ``pexpect``: Run the command in an advanced interactive mode using the additional \
+package ``pexpect`` (Availability: Unix). Use ``pexpect -h`` to get more help.
 
 3. Killing the Running Command:
 >>> If using common ``cmd`` or ``--kill_disabled`` is not specified in the interactive \
@@ -276,8 +277,12 @@ class CLI(
         return self.client.session_writer
     
     @property
-    def server_writer(self) -> MessageHandler:
-        return self.client.server_writer
+    def send_msg_to_session(self):
+        return self.client.send_msg_to_session
+    
+    @property
+    def send_msg_to_server(self):
+        return self.client.send_msg_to_server
     
     @property
     def server_version(self) -> Union[Tuple[int, int, int], None]:
@@ -606,12 +611,7 @@ class CLI(
                     'Server shutdown canceled.'
                 )
                 return False
-            self.server_writer.write(
-                Message(
-                    session_id=self.session_info.session_id,
-                    type='server_shutdown'
-                )
-            )
+            self.send_msg_to_server(type='server_shutdown')
         finally:
             return False
 
@@ -776,13 +776,7 @@ class Client(
         address = self.session_info.address
         session_id = self.session_info.session_id
         
-        res = self.server_writer.write(
-            Message(
-                session_id=self.session_info.session_id,
-                type='new_session'
-            )
-        )
-        
+        res = self.send_msg_to_server(type='new_session')
         if not res:
             return False
         if not wait_symbol(
@@ -893,6 +887,24 @@ class Client(
             logger.warning(
                 f'Missing args: {res}'
             )
+    
+    def send_msg_to_server(self, type: str, content: Union[dict, None] = None) -> bool:
+        return self.server_writer.write(
+            Message(
+                session_id=self.session_info.session_id,
+                type=type,
+                content=content
+            )
+        )
+    
+    def send_msg_to_session(self, type: str, content: Union[dict, None] = None) -> bool:
+        return self.session_writer.write(
+            Message(
+                session_id=self.session_info.session_id,
+                type=type,
+                content=content
+            )
+        )
 
 
 class ClientCommand(
@@ -939,8 +951,8 @@ class ClientCommand(
         return self.cli.session_info
     
     @property
-    def session_writer(self) -> MessageHandler:
-        return self.cli.session_writer
+    def send_msg_to_session(self):
+        return self.cli.send_msg_to_session
     
     @property
     def version_strict(self) -> bool:
@@ -961,7 +973,7 @@ class ClientCommand(
         """
         msg = self.msg
         session_info = self.session_info
-        session_writer = self.session_writer
+        send_msg_to_session = self.send_msg_to_session
         output_namespace = session_info.message_output_namespace(msg)
         output_reader = OutputFileHandler(output_namespace)
         confirm_fp = session_info.command_terminate_confirm_fp(msg)
@@ -1031,15 +1043,12 @@ class ClientCommand(
                 )
             ):
                 return
-            session_writer.write(
-                Message(
-                    session_id=session_info.session_id,
-                    type='kill_cmd',
-                    content={
-                        'cmd_id': msg.cmd_id,
-                        'type': type
-                    }
-                )
+            send_msg_to_session(
+                type='kill_cmd',
+                content={
+                    'cmd_id': msg.cmd_id,
+                    'type': type
+                }
             )
         
         def _process_keyboard_interrupt():
@@ -1061,12 +1070,9 @@ class ClientCommand(
                     state.reset_keyboard_interrupt()
             elif keyboard_interrupt_cnt >= CMD_BACKGROUND:
                 # Put the command to the background.
-                session_writer.write(
-                    Message(
-                        session_id=self.session_info.session_id,
-                        type='background_cmd',
-                        content={'cmd_id': msg.cmd_id}
-                    )
+                send_msg_to_session(
+                    type='background_cmd',
+                    content={'cmd_id': msg.cmd_id}
                 )
                 logger.info(
                     'Command is now put to the background, and use '
@@ -1221,8 +1227,8 @@ class InteractiveInput(
         return self.msg.cmd_id
     
     @property
-    def session_writer(self) -> MessageHandler:
-        return self.cmd.session_writer
+    def send_msg_to_session(self):
+        return self.cmd.send_msg_to_session
     
     @property
     def session_id(self) -> str:
@@ -1244,22 +1250,19 @@ class InteractiveInput(
         logger.info(
             f'You are in the interactive mode.'
         )
-        session_writer = self.session_writer
+        send_msg_to_session = self.send_msg_to_session
         state = self.state
         while True:
             try:
                 input_str = input()
                 if not self.cmd_running:
                     raise EOFError
-                session_writer.write(
-                    Message(
-                        session_id=self.session_id,
-                        type='cmd_input',
-                        content={
-                            'cmd_id': self.cmd_id,
-                            'input_str': input_str
-                        }
-                    )
+                send_msg_to_session(
+                    type='cmd_input',
+                    content={
+                        'cmd_id': self.cmd_id,
+                        'input_str': input_str
+                    }
                 )
             except KeyboardInterrupt:
                 with ignore_keyboard_interrupt():

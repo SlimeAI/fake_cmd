@@ -10,6 +10,7 @@ from slime_core.utils.typing import (
     Union
 )
 from . import config
+from .logging import logger
 
 #
 # For-loop generator functions.
@@ -92,6 +93,24 @@ def get_server_name(address: str) -> str:
         return possible_server_name
     else:
         return 'remote'
+
+
+def get_control_char(char: str) -> str:
+    """
+    Get the corresponding ``Ctrl-*`` char with the given char.
+    """
+    char = char.lower()
+    try:
+        index = ord(char)
+    except Exception as e:
+        logger.error(str(e), stack_info=True)
+        return ''
+    
+    if ord('a') <= index and index <= ord('z'):
+        return chr(index - ord('a') + 1)
+    # Other chars are not supported in this version (because they 
+    # are not used by the fake_cmd).
+    return ''
 
 #
 # Logical operations.

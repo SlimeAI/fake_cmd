@@ -23,7 +23,7 @@ from slime_core.utils.typing import (
     TYPE_CHECKING
 )
 from fake_cmd.utils import config
-from fake_cmd.utils.common import polling
+from fake_cmd.utils.common import polling, get_control_char
 from fake_cmd.utils.logging import logger
 if TYPE_CHECKING:
     from .reader import PopenReader, PexpectReader
@@ -443,6 +443,9 @@ class PexpectExecutor(Executor):
     
     def keyboard_interrupt(self) -> None:
         self.process.kill(signal.SIGINT)
+        if self.writable():
+            # Send ``Ctrl-C`` to the pty.
+            self.write(get_control_char('c'))
     
     def terminate(self) -> None:
         self.process.kill(signal.SIGTERM)
