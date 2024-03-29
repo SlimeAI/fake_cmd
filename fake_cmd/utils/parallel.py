@@ -14,7 +14,8 @@ from slime_core.utils.typing import (
     Iterable,
     Type
 )
-from . import polling, config, GreaterThanAnything
+from . import config
+from .common import GreaterThanAnything, polling
 if TYPE_CHECKING:
     from fake_cmd.core.server import SessionCommand
 

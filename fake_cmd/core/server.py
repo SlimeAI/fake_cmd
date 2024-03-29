@@ -24,6 +24,9 @@ from slime_core.utils.typing import (
     Nothing,
     Tuple
 )
+from fake_cmd.utils import (
+    config
+)
 from fake_cmd.utils.comm import (
     Connection,
     Message,
@@ -35,15 +38,11 @@ from fake_cmd.utils.comm import (
     MessageHandler,
     OutputFileHandler
 )
+from fake_cmd.utils.common import polling, timestamp_to_str
 from fake_cmd.utils.parallel import (
     CommandPool,
     LifecycleRun,
     ExitCallbackFunc
-)
-from fake_cmd.utils import (
-    polling,
-    config,
-    timestamp_to_str
 )
 from fake_cmd.utils.executors import (
     Executor,

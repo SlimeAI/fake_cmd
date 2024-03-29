@@ -15,7 +15,8 @@ from slime_core.utils.typing import (
     Sequence,
     Type
 )
-from . import config, ArgNamespace, parser_parse
+from . import config
+from .common import ArgNamespace, parser_parse
 from .logging import logger
 from .executors import platform_open_executor_registry
 from .executors.writer import popen_writer_registry

@@ -1,6 +1,6 @@
 import argparse
 from fake_cmd.core.client import CLI
-from fake_cmd.utils import parser_parse
+from fake_cmd.utils.common import parser_parse
 
 
 def get_args():

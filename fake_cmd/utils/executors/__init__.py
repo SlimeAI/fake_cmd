@@ -22,7 +22,8 @@ from slime_core.utils.typing import (
     Generic,
     TYPE_CHECKING
 )
-from fake_cmd.utils import config, polling
+from fake_cmd.utils import config
+from fake_cmd.utils.common import polling
 from fake_cmd.utils.logging import logger
 if TYPE_CHECKING:
     from .reader import PopenReader, PexpectReader

@@ -24,10 +24,7 @@ from slime_core.utils.typing import (
 )
 from fake_cmd.utils import (
     config,
-    polling,
-    get_server_name,
-    version_check,
-    uuid_base36
+    version_check
 )
 from fake_cmd.utils.comm import (
     Connection,
@@ -40,6 +37,7 @@ from fake_cmd.utils.comm import (
     MessageHandler,
     OutputFileHandler
 )
+from fake_cmd.utils.common import get_server_name, polling, uuid_base36
 from fake_cmd.utils.file import (
     remove_file_with_retry,
     remove_dir_with_retry

@@ -1,5 +1,4 @@
 import re
-import time
 import selectors
 import subprocess
 from slime_core.utils.registry import Registry
@@ -10,6 +9,7 @@ from slime_core.utils.typing import (
     Missing,
     MISSING
 )
+from fake_cmd.utils.common import timeout_loop
 from fake_cmd.utils.logging import logger
 from . import ExecutorComponent, PlatformPopenExecutor, PexpectExecutor
 
@@ -153,13 +153,9 @@ class PipePopenReader(PopenReader):
         self.selector.register(self.executor.stdout, selectors.EVENT_READ)
 
     def read(self, timeout: float) -> str:
-        start = time.time()
         content = ''
-        while True:
+        for _ in timeout_loop(timeout):
             content += self._selector_read_one()
-            stop = time.time()
-            if (stop - start) > timeout:
-                break
         return content
 
     def read_all(self) -> str:
@@ -266,13 +262,9 @@ class PexpectReader(ExecutorComponent[PexpectExecutor]):
 class DefaultPexpectReader(PexpectReader):
     
     def read(self, timeout: float) -> str:
-        start = time.time()
         content = ''
-        while True:
+        for _ in timeout_loop(timeout):
             content += self._read_one()
-            stop = time.time()
-            if (stop - start) > timeout:
-                break
         return content
     
     def read_all(self) -> str:

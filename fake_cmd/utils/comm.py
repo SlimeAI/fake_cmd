@@ -31,8 +31,9 @@ from slime_core.utils.typing import (
     Stop,
     STOP
 )
+from . import config
+from .common import LessThanAnything, polling, timeout_loop, uuid_base36, xor__
 from .exception import retry_deco
-from . import polling, config, xor__, LessThanAnything, uuid_base36
 from .logging import logger
 from .file import (
     remove_file_with_retry,
@@ -633,18 +634,16 @@ def wait_symbol(
     """
     timeout = config.symbol_wait_timeout if timeout is MISSING else timeout
     
-    start = time.time()
-    for _ in polling():
+    for _ in timeout_loop(
+        timeout,
+        interval=config.polling_interval
+    ):
         if xor__(
             os.path.exists(fp),
             wait_for_remove
         ):
             remove_symbol(fp)
             return True
-        
-        stop = time.time()
-        if (stop - start) > timeout:
-            return False
     return False
 
 
