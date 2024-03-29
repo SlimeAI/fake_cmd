@@ -435,7 +435,8 @@ class Session(
     
     @action_registry(key='pexpect_cmd')
     @param_check(required=[
-        'cmd', 'encoding', 'reader', 'kill_disabled', 'interactive'
+        'cmd', 'encoding', 'reader', 'kill_disabled', 'interactive',
+        'echo'
     ])
     def run_pexpect_cmd(self, msg: Message):
         """
@@ -714,7 +715,7 @@ class Session(
                 f'Missing args: {res}'
             )
             self.info_client(f'Server action missing args: {res}')
-            if msg.type in ('cmd', 'inner_cmd'):
+            if msg.type in ('cmd', 'inner_cmd', 'pexpect_cmd'):
                 # Notify that the command has terminated.
                 self.send_msg_to_client(
                     type='cmd_quit',
@@ -1084,7 +1085,8 @@ class PexpectShellCommand(ShellCommand):
                 content['cmd']
             ),
             reader=reader,
-            encoding=encoding
+            encoding=encoding,
+            echo=content['echo']
         )
         ShellCommand.__init__(
             self,

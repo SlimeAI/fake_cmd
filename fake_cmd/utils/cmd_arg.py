@@ -322,6 +322,13 @@ class PexpectParser(CMDParser):
                 'Whether keyboard interrupt is disabled to kill the command.'
             )
         )
+        parser.add_argument(
+            '--echo',
+            action='store_true',
+            help=(
+                'Whether enable echo mode (the input will be displayed again).'
+            )
+        )
         return parser
     
     def set_additional_args(self, args: ArgNamespace) -> None:
@@ -333,5 +340,6 @@ class PexpectParser(CMDParser):
             'encoding': args.encoding,
             'reader': args.reader,
             'interactive': args.interactive,
-            'kill_disabled': args.kill_disabled
+            'kill_disabled': args.kill_disabled,
+            'echo': args.echo
         }

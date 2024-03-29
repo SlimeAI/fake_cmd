@@ -388,19 +388,22 @@ class PexpectExecutor(Executor):
     """
     readonly_attr__ = (
         'reader',
-        'encoding'
+        'encoding',
+        'echo'
     )
     
     def __init__(
         self,
         pexpect_params: FuncParams,
         reader: "PexpectReader",
-        encoding: Union[str, None] = None
+        encoding: Union[str, None] = None,
+        echo: bool = False
     ) -> None:
         Executor.__init__(self)
         self.pexpect_params = pexpect_params
         self.reader = reader
         self.encoding = encoding or config.cmd_pipe_encoding
+        self.echo = echo
         # Bind Reader.
         self.reader.bind(self)
     
@@ -410,6 +413,12 @@ class PexpectExecutor(Executor):
             *self.pexpect_params.args,
             **self.pexpect_params.kwargs
         )
+        try:
+            # NOTE: Set echo here rather than in the ``__init__`` 
+            # method, because ``setecho`` may fail and raise exception.
+            self.process.setecho(self.echo)
+        except Exception as e:
+            logger.error(str(e), stack_info=True)
     
     def read(self, timeout: float) -> str:
         return self.reader.read(timeout)
