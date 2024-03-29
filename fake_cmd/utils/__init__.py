@@ -98,7 +98,8 @@ def version_check(
 
 
 def polling(
-    interval: float = MISSING
+    interval: float = MISSING,
+    ignore_keyboard_interrupt: bool = False
 ):
     """
     Polling with given interval. If not specified, 
@@ -108,7 +109,14 @@ def polling(
         interval if interval is not MISSING else config.polling_interval
     )
     while True:
-        time.sleep(interval)
+        try:
+            # NOTE: KeyboardInterrupt may be raised here and 
+            # it will propagate out of the for-loop if 
+            # ``ignore_keyboard_interrupt`` is False.
+            time.sleep(interval)
+        except KeyboardInterrupt:
+            if not ignore_keyboard_interrupt:
+                raise
         yield
 
 

@@ -1,8 +1,6 @@
 import os
 import sys
 import uuid
-import shlex
-import argparse
 from functools import wraps
 from contextlib import contextmanager
 from threading import Thread, Event, RLock
@@ -21,9 +19,15 @@ from slime_core.utils.typing import (
     Any,
     Literal,
     Missing,
-    List,
     Tuple,
     Iterable
+)
+from fake_cmd.utils import (
+    config,
+    polling,
+    get_server_name,
+    version_check,
+    uuid_base36
 )
 from fake_cmd.utils.comm import (
     Connection,
@@ -45,27 +49,20 @@ from fake_cmd.utils.parallel import (
     LifecycleRun,
     ExitCallbackFunc
 )
-from fake_cmd.utils.system import platform_open_registry
-from fake_cmd.utils import (
-    config,
-    polling,
-    get_server_name,
-    version_check,
-    parser_parse,
-    uuid_base36,
-    ArgNamespace
+from fake_cmd.utils.cmd_arg import (
+    cmd_parser_registry,
+    CMD_SEPARATOR,
+    CMDSplit,
+    split_cmd
 )
 from fake_cmd.utils.logging import logger
 from . import SessionInfo, ActionFunc, dispatch_action, param_check, SESSION_ID_SUFFIX
-from .server import popen_writer_registry
 
 # Keyboard interrupt count corresponding to different meanings.
 CMD_INTERRUPT = 1
 CMD_TERMINATE = 2
 CMD_KILL = 3
 CMD_BACKGROUND = 4
-# Separator to separate between command options and session command.
-CMD_SEPARATOR = ' -- '
 # Document Separator length
 DOC_SEP_LEN = 50
 
@@ -208,9 +205,9 @@ def cli_action_version_check(
     max_version: Union[Tuple[int, int, int], None] = None,
     verbose: bool = True
 ):
-    def decorator(func: Callable[..., Union["Command", Literal[False]]]):
+    def decorator(func: Callable[..., Union["ClientCommand", Literal[False]]]):
         @wraps(func)
-        def wrapper(self: "CLI", *args, **kwargs) -> Union["Command", Literal[False]]:
+        def wrapper(self: "CLI", *args, **kwargs) -> Union["ClientCommand", Literal[False]]:
             if (
                 self.version_strict and 
                 not version_check(
@@ -226,8 +223,7 @@ def cli_action_version_check(
     return decorator
 
 
-CMDSplit = Tuple[Union[List[str], Missing], Union[str, Missing]]
-CLIActionFunc = Callable[[Any, CMDSplit], Union["Command", Literal[False]]]
+CLIActionFunc = Callable[[Any, CMDSplit], Union["ClientCommand", Literal[False]]]
 
 
 class CLI(
@@ -259,14 +255,11 @@ class CLI(
     ):
         LifecycleRun.__init__(self)
         self.client = Client(self, address, id_prefix)
-        self.current_cmd: Union["Command", None] = None
+        self.current_cmd: Union["ClientCommand", None] = None
         # Use a current cmd lock to make it consistent with 
         # the current waiting server cmd.
         self.current_cmd_lock = RLock()
         self.server_name = get_server_name(self.session_info.address)
-        # parsers
-        self.cmd_parser = get_cmd_parser()
-        self.inter_cmd_parser = get_inter_cmd_parser()
     
     @property
     def session_info(self) -> SessionInfo:
@@ -296,7 +289,7 @@ class CLI(
     def version_strict(self) -> bool:
         return self.client.version_strict
     
-    def set_current_cmd(self, cmd: Union["Command", None]) -> None:
+    def set_current_cmd(self, cmd: Union["ClientCommand", None]) -> None:
         with self.current_cmd_lock:
             self.current_cmd = cmd
     
@@ -369,7 +362,7 @@ class CLI(
     # Command operations.
     #
     
-    def process_cmd(self, cmd_str: Union[str, None]) -> Union["Command", Literal[False]]:
+    def process_cmd(self, cmd_str: Union[str, None]) -> Union["ClientCommand", Literal[False]]:
         """
         Process the input cmd. Return a ``Command`` object if the cmd should 
         be executed in the server and it is successfully received, else return 
@@ -389,19 +382,18 @@ class CLI(
             cli_func = self.cli_registry.get(possible_options[0], MISSING)
         if cli_func is MISSING:
             # Parse default args.
-            args = parser_parse(
-                parser=self.cmd_parser,
+            cmd_parser = cmd_parser_registry.get('cmd')()
+            args = cmd_parser.parse_args(
                 args=[],
                 strict=False
             )
             if args is MISSING:
                 return False
             
-            set_cmd_args(args)
             # The whole ``cmd_str`` will be seen as a command.
             args.cmd = cmd_str
             return self.send_session_cmd(
-                content=self._make_cmd_content_through_args(args),
+                content=cmd_parser.make_cmd_content(args),
                 type='cmd'
             )
         else:
@@ -415,7 +407,7 @@ class CLI(
         self,
         content: dict,
         type: str = 'cmd'
-    ) -> Union["Command", Literal[False]]:
+    ) -> Union["ClientCommand", Literal[False]]:
         """
         Send the command to the session.
         """
@@ -429,7 +421,7 @@ class CLI(
         def cmd_exit(*args):
             self.set_current_cmd(None)
         
-        cmd = Command(cli=self, msg=msg, exit_callbacks=[cmd_exit])
+        cmd = ClientCommand(cli=self, msg=msg, exit_callbacks=[cmd_exit])
         self.set_current_cmd(cmd)
         with ignore_keyboard_interrupt():
             # NOTE: This process should not be interrupted.
@@ -439,7 +431,7 @@ class CLI(
                 return False
             return cmd
     
-    def wait_cmd(self, cmd: "Command"):
+    def wait_cmd(self, cmd: "ClientCommand"):
         """
         Wait until the command quit.
         """
@@ -522,75 +514,38 @@ class CLI(
         logger.info('Set ``version_strict`` to ``False``.')
         return False
     
-    def _make_cmd_content_through_args(self, args) -> dict:
-        return {
-            'cmd': args.cmd,
-            'encoding': args.encoding,
-            'stdin': args.stdin,
-            'exec': args.exec,
-            'platform': args.platform,
-            'interactive': args.interactive,
-            'kill_disabled': args.kill_disabled
-        }
-    
-    def _parse_cmd(
-        self,
-        cmd_splits: CMDSplit,
-        parser: argparse.ArgumentParser,
-        strict: bool
-    ) -> Union[ArgNamespace, Literal[False]]:
-        possible_options, possible_cmd = cmd_splits
-        if (
-            possible_options is MISSING or 
-            possible_cmd is MISSING
-        ):
-            return False
-        
-        args = parser_parse(
-            parser=parser,
-            args=possible_options[1:],
-            strict=strict
-        )
-        if args is MISSING:
-            return False
-        
-        args.cmd = possible_cmd
-        return args
-    
     @cli_registry(key='inter')
     @cli_action_version_check(min_version=(0, 0, 2))
-    def interactive_cmd(self, cmd_splits: CMDSplit) -> Union["Command", Literal[False]]:
+    def interactive_cmd(self, cmd_splits: CMDSplit) -> Union["ClientCommand", Literal[False]]:
         """
         Open command in an interactive mode.
         """
-        args = self._parse_cmd(
+        cmd_parser = cmd_parser_registry.get('inter')()
+        args = cmd_parser.parse_cmd(
             cmd_splits=cmd_splits,
-            parser=self.inter_cmd_parser,
             strict=False
         )
         if not args:
             return False
         
-        set_inter_cmd_args(args)
         return self.send_session_cmd(
-            content=self._make_cmd_content_through_args(args),
+            content=cmd_parser.make_cmd_content(args),
             type='cmd'
         )
     
     @cli_registry(key='cmd')
     @cli_action_version_check(min_version=(0, 0, 2))
-    def escape_cmd(self, cmd_splits: CMDSplit) -> Union["Command", Literal[False]]:
-        args = self._parse_cmd(
+    def escape_cmd(self, cmd_splits: CMDSplit) -> Union["ClientCommand", Literal[False]]:
+        cmd_parser = cmd_parser_registry.get('cmd')()
+        args = cmd_parser.parse_cmd(
             cmd_splits=cmd_splits,
-            parser=self.cmd_parser,
             strict=False
         )
         if not args:
             return False
         
-        set_cmd_args(args)
         return self.send_session_cmd(
-            content=self._make_cmd_content_through_args(args),
+            content=cmd_parser.make_cmd_content(args),
             type='cmd'
         )
     
@@ -600,7 +555,7 @@ class CLI(
         'ls-cmd'
     ])
     @cli_action_version_check(min_version=(0, 0, 1))
-    def inner_cmd(self, cmd_splits: CMDSplit) -> Union["Command", Literal[False]]:
+    def inner_cmd(self, cmd_splits: CMDSplit) -> Union["ClientCommand", Literal[False]]:
         possible_options, _ = cmd_splits
         if possible_options is MISSING:
             return False
@@ -919,7 +874,7 @@ class Client(
             )
 
 
-class Command(
+class ClientCommand(
     LifecycleRun,
     Thread,
     ReadonlyAttr,
@@ -1230,7 +1185,7 @@ class InteractiveInput(
         'quit'
     )
     
-    def __init__(self, cmd: Command) -> None:
+    def __init__(self, cmd: ClientCommand) -> None:
         LifecycleRun.__init__(self)
         ReadonlyAttr.__init__(self)
         self.cmd = cmd
@@ -1303,128 +1258,3 @@ class InteractiveInput(
     
     def after_running(self, __exc_type=None, __exc_value=None, __traceback=None):
         self.quit.set()
-
-#
-# Command argument parsers.
-#
-
-def split_cmd(cmd_str: str) -> Union[CMDSplit, Literal[False]]:
-    """
-    Split the command str into possible command options and possible 
-    session command.
-    
-    Example:
-    ```Python
-    # (['inter'], 'python -i')
-    split_cmd('inter -- python -i')
-    # (['inter', '--stdin', 'pty'], MISSING<0x7fa1282a4310>)
-    split_cmd('inter --stdin pty')
-    # (['inter', '--exec', '/path/with white space', '--stdin', 'pty'], 'python -i')
-    split_cmd('inter --exec "/path/with white space" --stdin pty -- python -i')
-    # (MISSING<id>, 'a')
-    split_cmd(' -- a')
-    # (['a'], '')
-    split_cmd('a -- ')
-    # (MISSING<id>, '')
-    split_cmd(' -- ')
-    ```
-    """
-    cmd_splits = cmd_str.split(CMD_SEPARATOR, 1)
-    split_len = len(cmd_splits)
-    if split_len == 0:
-        return False
-    elif split_len > 2:
-        logger.warning(
-            'Expect the length of ``cmd_splits`` to be no more than 2, '
-            f'but {split_len} found. Split result: {cmd_splits}'
-        )
-        return False
-    
-    # Split the possible command options for further analyzing.
-    shlex_splits = shlex.split(cmd_splits[0], posix=config.posix_shlex)
-    if len(shlex_splits) == 0:
-        shlex_splits = MISSING
-    if split_len == 1:
-        return shlex_splits, MISSING
-    else:
-        return shlex_splits, cmd_splits[1]
-
-
-def _get_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        '--encoding',
-        default=None,
-        type=str,
-        required=False,
-        help=(
-            'The encoding method of input and output. Should not '
-            'be specified most of the time (and leave it default).'
-        )
-    )
-    parser.add_argument(
-        '--exec',
-        default=None,
-        type=str,
-        required=False,
-        help=(
-            'The executable script path. Should not be specified '
-            'most of the time (and leave it default).'
-        )
-    )
-    parser.add_argument(
-        '--platform',
-        default=None,
-        type=str,
-        required=False,
-        help=(
-            'The running platform that decides process operations. '
-            'Should not be specified most of the time (and leave it '
-            'default).'
-        ),
-        choices=platform_open_registry.keys()
-    )
-    return parser
-
-
-def get_cmd_parser() -> argparse.ArgumentParser:
-    parser = _get_parser()
-    parser.prog = 'cmd'
-    return parser
-
-
-def set_cmd_args(args: ArgNamespace) -> None:
-    # Set other command arguments.
-    args.interactive = False
-    args.kill_disabled = False
-    args.stdin = None
-
-
-def get_inter_cmd_parser() -> argparse.ArgumentParser:
-    parser = _get_parser()
-    parser.prog = 'inter'
-    # Set the default to 'pipe'.
-    parser.add_argument(
-        '--stdin',
-        default='pipe',
-        type=str,
-        choices=popen_writer_registry.keys(),
-        required=False,
-        help=(
-            'The interactive input setting. Specify the stdin '
-            'setting of Popen.'
-        )
-    )
-    parser.add_argument(
-        '--kill_disabled',
-        action='store_true',
-        help=(
-            'Whether keyboard interrupt is disabled to kill the command.'
-        )
-    )
-    return parser
-
-
-def set_inter_cmd_args(args: ArgNamespace) -> None:
-    # Set other interactive command arguments.
-    args.interactive = True

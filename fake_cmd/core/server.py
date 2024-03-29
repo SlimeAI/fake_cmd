@@ -1,7 +1,5 @@
 import os
 import time
-import selectors
-import subprocess
 from threading import Thread, Event, RLock
 from abc import ABCMeta
 from slime_core.utils.common import FuncParams
@@ -24,14 +22,11 @@ from slime_core.utils.typing import (
     Callable,
     Any,
     Nothing,
-    IO,
-    Tuple,
-    Type
+    Tuple
 )
 from fake_cmd.utils.comm import (
     Connection,
     Message,
-    StreamBytesParser,
     create_symbol,
     wait_symbol,
     check_symbol,
@@ -50,7 +45,9 @@ from fake_cmd.utils import (
     config,
     timestamp_to_str
 )
-from fake_cmd.utils.system import PlatformPopen, platform_open_registry, DefaultPopen
+from fake_cmd.utils.executors import Executor, platform_open_executor_registry, DefaultPopenExecutor
+from fake_cmd.utils.executors.reader import PopenReader, popen_reader_registry, PipePopenReader
+from fake_cmd.utils.executors.writer import PopenWriter, popen_writer_registry
 from fake_cmd.utils.exception import ServerShutdown, ignore_keyboard_interrupt
 from fake_cmd.utils.logging import logger
 from . import ServerInfo, SessionInfo, dispatch_action, ActionFunc, param_check
@@ -211,7 +208,7 @@ class Server(
                 session.join(config.server_shutdown_wait_timeout)
             # Kill all the commands in the command pool.
             for cmd in tuple(self.cmd_pool.update_and_get_execute()):
-                cmd.process.kill()
+                cmd.executor.kill()
             # Check the shutdown state.
             if any(map(lambda session: session.is_alive(), sessions)):
                 logger.warning(
@@ -316,7 +313,7 @@ class Session(
             self.session_info.heartbeat_session_fp,
             self.session_info.heartbeat_client_fp
         )
-        self.running_cmd: Union[Command, None] = None
+        self.running_cmd: Union[SessionCommand, None] = None
         self.running_cmd_lock = RLock()
         self.background_cmds = BackgroundCommandList()
         # Created time.
@@ -384,7 +381,7 @@ class Session(
         self.clear_cache()
         # Kill all the background commands.
         for back_cmd in tuple(self.background_cmds.update_and_get()):
-            back_cmd.process.kill()
+            back_cmd.executor.kill()
         
         # Wait all the commands to finish.
         running_cmd = self.running_cmd
@@ -399,7 +396,7 @@ class Session(
     
     @action_registry(key='cmd')
     @param_check(required=(
-        'cmd', 'encoding', 'stdin', 'exec', 
+        'cmd', 'encoding', 'reader', 'writer', 'exec', 
         'platform', 'kill_disabled', 'interactive'
     ))
     def run_new_cmd(self, msg: Message):
@@ -407,7 +404,7 @@ class Session(
             self.cmd_pool.cancel(cmd)
             self.reset_running_cmd()
         
-        cmd = ShellCommand(
+        cmd = PopenShellCommand(
             session=self,
             msg=msg,
             exit_callbacks=[terminate_command_func]
@@ -462,8 +459,8 @@ class Session(
             if not running_cmd:
                 return
             
-            stdin = running_cmd.stdin
-            if not stdin.writable():
+            executor = running_cmd.executor
+            if not executor.writable():
                 self.client_writer.write(
                     Message(
                         session_id=self.session_id,
@@ -478,7 +475,7 @@ class Session(
                 )
                 return
             # Write to the cmd.
-            res = stdin.write(f'{input_str}\n')
+            res = executor.write_line(input_str)
             if not res:
                 self.client_writer.write(
                     Message(
@@ -492,7 +489,7 @@ class Session(
                     )
                 )
     
-    def running_cmd_check(self, cmd_id: str) -> Union["Command", Literal[False]]:
+    def running_cmd_check(self, cmd_id: str) -> Union["SessionCommand", Literal[False]]:
         """
         Check if the msg command id is equal to that of 
         the running command.
@@ -510,7 +507,7 @@ class Session(
     
     def notify_cmd_inconsistency(
         self,
-        running_cmd: "Command",
+        running_cmd: "SessionCommand",
         incoming_cmd_id: str
     ):
         """
@@ -536,7 +533,7 @@ class Session(
     
     def safely_terminate_cmd(
         self,
-        cmd: Union["Command", Missing] = MISSING,
+        cmd: Union["SessionCommand", Missing] = MISSING,
         cause: Literal[
             'remote', 'local', 'destroy', 'disconnect', 'force', 'keyboard'
         ] = 'remote'
@@ -580,7 +577,7 @@ class Session(
                 cmd.run_exit_callbacks__()
                 cmd.after_running()
     
-    def set_running_cmd(self, running_cmd: Union["Command", None]):
+    def set_running_cmd(self, running_cmd: Union["SessionCommand", None]):
         """
         Return whether the set operation succeeded.
         """
@@ -728,7 +725,7 @@ class Session(
                 )
 
 
-class Command(
+class SessionCommand(
     LifecycleRun,
     Thread,
     ReadonlyAttr,
@@ -737,24 +734,26 @@ class Command(
     readonly_attr__ = (
         'session',
         'msg',
-        'cmd_state'
+        'executor',
+        'cmd_state',
+        'output_writer'
     )
     
     def __init__(
         self,
         session: Session,
         msg: Message,
-        exit_callbacks: Union[Iterable[ExitCallbackFunc], None] = None
+        exit_callbacks: Union[Iterable[ExitCallbackFunc], None] = None,
+        executor: Union[Executor, Nothing] = NOTHING
     ):
         LifecycleRun.__init__(self, exit_callbacks)
         Thread.__init__(self)
         self.session = session
         self.msg = CommandMessage.clone(msg)
-        # The running process (if any).
-        self.process: Union[PlatformPopen, Nothing] = NOTHING
+        # The running process executor (if any).
+        self.executor = executor
         self.cmd_state = CommandState()
         self.output_writer = OutputFileHandler(self.output_namespace)
-        self.stdin = default_popen_writer
     
     @property
     def session_info(self) -> SessionInfo:
@@ -893,82 +892,38 @@ class Command(
     #
     
     def to_str(self) -> str:
+        # TODO
         return (
             f'Command(cmd="{self.msg.content["cmd"]}", cmd_id="{self.msg.cmd_id}", '
             f'session_id="{self.session_info.session_id}", '
             f'created_time={timestamp_to_str(self.msg.timestamp)}, '
-            f'pid={str(self.process.pid)}, writer={self.stdin.to_str()})'
+            f'pid={str(self.executor.pid)}, executor=)'
         )
     
     def __bool__(self) -> bool:
         return True
 
 
-class ShellCommand(Command):
-    
-    readonly_attr__ = (
-        'encoding',
-        'exec',
-        'platform'
-    )
-    
-    def __init__(
-        self,
-        session: Session,
-        msg: Message,
-        exit_callbacks: Union[Iterable[ExitCallbackFunc], None] = None
-    ):
-        Command.__init__(self, session, msg, exit_callbacks)
-        content: dict = msg.content
-        encoding: Union[str, None] = content['encoding']
-        stdin: Union[str, None] = content['stdin']
-        
-        if self.msg.kill_disabled:
-            # Set kill disabled.
-            self.cmd_state.kill_disabled.set()
-        self.encoding = encoding or config.cmd_pipe_encoding
-        if stdin:
-            self.stdin = popen_writer_registry.get(stdin, PopenWriter)(encoding=self.encoding)
-        self.exec = content['exec'] or config.cmd_executable
-        self.platform: str = content['platform'] or config.platform
+class ShellCommand(SessionCommand):
     
     def running(self) -> None:
-        msg = self.msg
-        content = msg.content
+        # Start the command exec.
+        executor = self.executor
         state = self.cmd_state
-        process = platform_open_registry.get(self.platform, DefaultPopen)(
-            popen_params=FuncParams(
-                content['cmd'],
-                shell=True,
-                stdin=self.stdin.get_popen_stdin(),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                executable=self.exec,
-                bufsize=0,
-                text=False
-            )
-        )
-        # Set process.
-        self.process = process
-        self.stdin.process = process
-        # Init reader.
-        reader = PipeReader(
-            stdout=process.stdout,
-            encoding=self.encoding
-        )
         # Flags indicating wether the signals have been 
         # sent.
         interrupt_sent = False
         terminate_sent = False
         kill_sent = False
-        stdin_closed = False
+        reader_closed = False
+        writer_closed = False
         
         def _process_kill_signals():
             """
             Process the kill signals (SIGINT, SIGTERM, SIGKILL, etc.)
             """
             nonlocal kill_sent, terminate_sent, interrupt_sent
-            nonlocal stdin_closed
+            nonlocal reader_closed, writer_closed
             if (
                 (
                     state.terminate_local.is_set() or 
@@ -977,42 +932,43 @@ class ShellCommand(Command):
                 ) and not kill_sent
             ):
                 # Directly kill the process.
-                process.kill()
+                executor.kill()
                 kill_sent = True
             elif (
                 state.terminate_remote.is_set() and 
                 not terminate_sent
             ):
                 # Terminate the process.
-                process.terminate()
+                executor.terminate()
                 terminate_sent = True
             elif state.kill_disabled.is_set():
                 if state.keyboard_interrupt.is_set():
                     # Can send keyboard interrupt multiple times 
                     # according to the user behavior.
-                    process.keyboard_interrupt()
+                    executor.keyboard_interrupt()
                     state.keyboard_interrupt.clear()
             elif (
                 state.keyboard_interrupt.is_set() and 
                 not interrupt_sent
             ):
                 # Send keyboard interrupt.
-                process.keyboard_interrupt()
+                executor.keyboard_interrupt()
                 interrupt_sent = True
             
-            if (
-                state.pending_terminate and 
-                not stdin_closed
-            ):
-                # NOTE: Should close the stdin here if possible. 
+            if state.pending_terminate:
+                # NOTE: Should close read and write here if possible. 
                 # Otherwise, writers like 'pty' will never be closed. 
-                # ``PipeWriter`` will do nothing here, because the 
-                # ``__exit__`` of ``process`` will close stdin 
-                # automatically.
-                self.stdin.close()
-                stdin_closed = True
+                # ``PipePopenWriter`` will do nothing here, because 
+                # the ``__exit__`` of ``executor`` will close stdin, 
+                # stdout and stderr automatically.
+                if not reader_closed:
+                    executor.close_read()
+                    reader_closed = True
+                if not writer_closed:
+                    executor.close_write()
+                    writer_closed = True
         
-        with process:
+        with executor:
             for _ in polling(config.cmd_polling_interval):
                 # NOTE: DO NOT return after the signal is sent, 
                 # and it should always wait until the process 
@@ -1020,15 +976,15 @@ class ShellCommand(Command):
                 _process_kill_signals()
                 # Write outputs.
                 self.output_writer.write(
-                    reader.read(config.cmd_pipe_read_timeout)
+                    executor.read(config.cmd_pipe_read_timeout)
                 )
                 
-                if process.poll() is not None:
+                if not executor.is_running():
                     break
             
             if not state.pending_terminate:
                 # Read all the remaining content.
-                self.output_writer.write(reader.read_all())
+                self.output_writer.write(executor.read_all())
                 # Normally finished.
                 state.finished.set()
             else:
@@ -1037,11 +993,59 @@ class ShellCommand(Command):
                 # process is killed, but its subprocesses are still alive and 
                 # producing outputs), the command may get stuck reading endlessly.
                 self.output_writer.write(
-                    reader.read(config.cmd_pipe_read_timeout_when_terminate)
+                    executor.read(config.cmd_pipe_read_timeout_when_terminate)
                 )
 
 
-class InnerCommand(Command):
+class PopenShellCommand(ShellCommand):
+    
+    def __init__(
+        self,
+        session: Session,
+        msg: Message,
+        exit_callbacks: Union[Iterable[ExitCallbackFunc], None] = None
+    ):
+        content: dict = msg.content
+        encoding: str = content['encoding'] or config.cmd_pipe_encoding
+        reader: PopenReader = popen_reader_registry.get(content['reader'], PipePopenReader)()
+        writer: PopenWriter = popen_writer_registry.get(content['writer'], PopenWriter)()
+        exec: Union[str, None] = content['exec'] or config.cmd_executable
+        platform: str = content['platform'] or config.platform
+        # Create Executor object.
+        executor = platform_open_executor_registry.get(platform, DefaultPopenExecutor)(
+            popen_params=FuncParams(
+                content['cmd'],
+                shell=True,
+                stdin=writer.get_popen_stdin(),
+                stdout=reader.get_popen_stdout(),
+                stderr=reader.get_popen_stderr(),
+                executable=exec,
+                bufsize=0,
+                text=False
+            ),
+            reader=reader,
+            writer=writer,
+            encoding=encoding
+        )
+        ShellCommand.__init__(
+            self,
+            session=session,
+            msg=msg,
+            exit_callbacks=exit_callbacks,
+            executor=executor
+        )
+        # NOTE: This should be called after the Message object has been converted to 
+        # a CommandMessage object in SessionCommand.
+        if self.msg.kill_disabled:
+            # Set kill disabled.
+            self.cmd_state.kill_disabled.set()
+
+
+class PexpectShellCommand(ShellCommand):
+    pass
+
+
+class InnerCommand(SessionCommand):
     
     inner_cmd_registry = Registry[Callable[[Any], None]]('inner_cmd_registry')
     
@@ -1113,7 +1117,7 @@ class InnerCommand(Command):
 #
 
 class BackgroundCommandList(
-    BaseList[Command],
+    BaseList[SessionCommand],
     ReadonlyAttr,
     metaclass=Metaclasses(ABCMeta, _ReadonlyAttrMetaclass, InitOnceMetaclass)
 ):
@@ -1127,7 +1131,7 @@ class BackgroundCommandList(
         # Use a lock to make it safe.
         self.lock = RLock()
     
-    def __setitem__(self, __key, __value: Command):
+    def __setitem__(self, __key, __value: SessionCommand):
         with self.lock:
             super().__setitem__(__key, __value)
             self.update_command_states__()
@@ -1137,7 +1141,7 @@ class BackgroundCommandList(
             super().__delitem__(__key)
             self.update_command_states__()
     
-    def insert(self, __index, __object: Command):
+    def insert(self, __index, __object: SessionCommand):
         with self.lock:
             super().insert(__index, __object)
             self.update_command_states__()
@@ -1155,214 +1159,3 @@ class BackgroundCommandList(
         """
         self.update_command_states__()
         return self
-
-#
-# Process input / output.
-#
-
-class PipeReader(ReadonlyAttr):
-    """
-    Non-blocking read stdout pipes within timeout.
-    """
-    readonly_attr__ = (
-        'stdout',
-        'selector',
-        'encoding',
-        'bytes_parser'
-    )
-    
-    def __init__(
-        self,
-        stdout: IO[bytes],
-        encoding: str = 'utf-8'
-    ) -> None:
-        self.stdout = stdout
-        # NOTE: Use ``selector`` to get non-blocking outputs.
-        self.selector = selectors.DefaultSelector()
-        self.selector.register(stdout, selectors.EVENT_READ)
-        self.encoding = encoding
-        self.bytes_parser = StreamBytesParser(encoding=self.encoding)
-    
-    def read(self, timeout: float) -> str:
-        """
-        Read the content within the timeout. This method 
-        concat the results of ``_selector_read_one`` within 
-        the timeout and return.
-        """
-        start = time.time()
-        content = ''
-        while True:
-            content += self._selector_read_one()
-            stop = time.time()
-            if (stop - start) > timeout:
-                break
-        return content
-    
-    def read_all(self) -> str:
-        """
-        Read all the content util file end. Make sure the 
-        process is end when you call ``read_all``, else the 
-        read will be blocked.
-        """
-        # Non-blocking mode.
-        for key, _ in self.selector.select(0):
-            if key.fileobj == self.stdout:
-                # If ready, read all and return.
-                try:
-                    self.stdout.flush()
-                except Exception as e:
-                    logger.error(str(e), stack_info=True)
-                return str(
-                    self.bytes_parser.parse(self.stdout.read())
-                )
-        # If not ready, directly return empty str.
-        return ''
-    
-    def _selector_read_one(self) -> str:
-        """
-        Read one char if selector is ready.
-        """
-        # Non-blocking mode.
-        for key, _ in self.selector.select(0):
-            if key.fileobj == self.stdout:
-                # If ready, read one char and return.
-                return str(
-                    self.bytes_parser.parse(self.stdout.read(1))
-                )
-        # If no output, directly return empty str.
-        return ''
-
-
-class PopenWriter(ReadonlyAttr):
-    """
-    Interface to write user input to the process.
-    """
-    readonly_attr__ = ('encoding',)
-    
-    def __init__(
-        self,
-        encoding: Union[str, None] = None
-    ) -> None:
-        self.encoding = encoding or config.cmd_pipe_encoding
-        self.process: Union[PlatformPopen, Nothing] = NOTHING
-
-    def write(self, content: str) -> bool:
-        return False
-    
-    def writable(self) -> bool:
-        return False
-    
-    def get_popen_stdin(self):
-        """
-        Get the stdin argument passed to ``Popen``.
-        """
-        return None
-    
-    def close(self):
-        """
-        Close the stdin.
-        """
-        pass
-    
-    def to_str(self) -> str:
-        return f'{self.__class__.__name__}()'
-
-
-default_popen_writer = PopenWriter()
-popen_writer_registry = Registry[Type[PopenWriter]]('popen_writer_registry')
-
-
-@popen_writer_registry(key='pipe')
-class PipeWriter(PopenWriter):
-    
-    def write(self, content: str) -> bool:
-        popen_stdin = self.process.stdin
-        if not popen_stdin:
-            logger.warning(
-                'Popen stdin or its pipe is NoneOrNothing.'
-            )
-            return False
-        
-        try:
-            popen_stdin.write(
-                content.encode(self.encoding)
-            )
-            popen_stdin.flush()
-        except Exception as e:
-            logger.error(str(e), stack_info=True)
-            return False
-        else:
-            return True
-    
-    def writable(self) -> bool:
-        return True
-    
-    def get_popen_stdin(self):
-        return subprocess.PIPE
-    
-    def close(self):
-        # Do nothing here, because the subprocess 
-        # will automatically close the stdin on 
-        # ``__exit__``.
-        return
-    
-    def to_str(self) -> str:
-        popen_stdin = self.process.stdin
-        fileno = popen_stdin.fileno() if popen_stdin else None
-        return (
-            f'{self.__class__.__name__}'
-            f'(stdin={str(popen_stdin)}, '
-            f'stdin_fileno={str(fileno)})'
-        )
-
-
-@popen_writer_registry(key='pty')
-class PtyWriter(PopenWriter):
-    readonly_attr__ = (
-        'master',
-        'slave'
-    )
-    
-    def __init__(
-        self,
-        encoding: Union[str, None] = None
-    ) -> None:
-        super().__init__(encoding)
-        import pty
-        self.master, self.slave = pty.openpty()
-    
-    def write(self, content: str) -> bool:
-        try:
-            os.write(
-                self.master,
-                f'{content}'.encode(self.encoding)
-            )
-        except Exception as e:
-            logger.error(str(e), stack_info=True)
-            return False
-        else:
-            return True
-    
-    def writable(self) -> bool:
-        return True
-    
-    def get_popen_stdin(self):
-        return self.slave
-    
-    def close(self):
-        # Should manually close the pty.
-        try:
-            os.close(self.master)
-        except Exception as e:
-            logger.error(str(e), stack_info=True)
-        
-        try:
-            os.close(self.slave)
-        except Exception as e:
-            logger.error(str(e), stack_info=True)
-    
-    def to_str(self) -> str:
-        return (
-            f'{self.__class__.__name__}'
-            f'(master={self.master}, slave={self.slave})'
-        )

@@ -16,7 +16,7 @@ from slime_core.utils.typing import (
 )
 from . import polling, config, GreaterThanAnything
 if TYPE_CHECKING:
-    from fake_cmd.core.server import Command
+    from fake_cmd.core.server import SessionCommand
 
 
 ExitCallbackFunc = Callable[
@@ -66,9 +66,9 @@ class CommandPool(ReadonlyAttr):
         self,
         max_threads: Union[int, None] = None
     ) -> None:
-        self.queue: List["Command"] = []
+        self.queue: List["SessionCommand"] = []
         self.queue_lock = RLock()
-        self.execute: List["Command"] = []
+        self.execute: List["SessionCommand"] = []
         self.execute_lock = RLock()
         self.max_threads = max_threads or GreaterThanAnything()
         self.pool_close = Event()
@@ -126,7 +126,7 @@ class CommandPool(ReadonlyAttr):
     def close(self):
         self.pool_close.set()
     
-    def submit(self, cmd: "Command") -> bool:
+    def submit(self, cmd: "SessionCommand") -> bool:
         """
         Submit a command and return whether the command will be executed 
         immediately.
@@ -139,7 +139,7 @@ class CommandPool(ReadonlyAttr):
                 cmd.info_queued()
             return (not queued)
     
-    def cancel(self, command: "Command") -> bool:
+    def cancel(self, command: "SessionCommand") -> bool:
         with self.queue_lock:
             if command not in self.queue:
                 return False
@@ -149,7 +149,7 @@ class CommandPool(ReadonlyAttr):
                 pass
             return True
     
-    def update_and_get_execute(self) -> List["Command"]:
+    def update_and_get_execute(self) -> List["SessionCommand"]:
         with self.execute_lock:
             self.execute = list(filter(
                 lambda exec: exec.is_alive(),
