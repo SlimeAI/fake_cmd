@@ -751,6 +751,10 @@ class Session(
 # Commands
 #
 
+# TODO: We are considering changing the ``SessionCommand`` from a ``Thread`` to a 
+# ``Process``, because ``os.fork`` and ``os.forkpty`` may cause deadlock in the 
+# multithreading mode (and the usage is deprecated since Python 3.12). This problem 
+# may involve the ``pexpect`` module.
 class SessionCommand(
     LifecycleRun,
     Thread,
