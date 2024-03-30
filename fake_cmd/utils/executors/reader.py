@@ -143,6 +143,9 @@ class PipePopenReader(PopenReader):
     def __init__(self) -> None:
         PopenReader.__init__(self)
         # NOTE: Use ``selector`` to get non-blocking outputs.
+        # TODO: If ``SessionCommand`` changes to a ``Process``, then the 
+        # ``DefaultSelector`` should be created in the ``read_init`` method 
+        # (which runs in the subprocess).
         self.selector = selectors.DefaultSelector()
         self.bytes_parser: Union[StreamBytesParser, Missing] = MISSING
     
