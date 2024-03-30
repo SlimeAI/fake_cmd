@@ -195,3 +195,22 @@ def uuid_base36(number: int) -> str:
         base36_num = BASE36_CHARS[remainder] + base36_num
 
     return base36_num.rjust(NUMBER_DIGITS, '0')
+
+#
+# Inspect services.
+#
+
+def resolve_classname(obj: Any) -> str:
+    """
+    Try to resolve the classname of the given object.
+    """
+    cls = type(obj)
+    candidate_classname_tuple = (
+        getattr(cls, '__name__', None),
+        getattr(cls, '__qualname__', None),
+        str(cls)
+    )
+    for classname in candidate_classname_tuple:
+        if classname:
+            return classname
+    return str(obj)

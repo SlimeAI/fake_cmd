@@ -9,7 +9,7 @@ from slime_core.utils.typing import (
     Missing,
     MISSING
 )
-from fake_cmd.utils.common import timeout_loop
+from fake_cmd.utils.common import timeout_loop, resolve_classname
 from fake_cmd.utils.logging import logger
 from . import ExecutorComponent, PlatformPopenExecutor, PexpectExecutor
 
@@ -125,6 +125,9 @@ class PopenReader(ExecutorComponent[PlatformPopenExecutor]):
         Get the stderr argument passed to ``Popen``.
         """
         return None
+    
+    def __str__(self) -> str:
+        return f'{resolve_classname(self)}()'
 
 
 @popen_reader_registry(key='default')
@@ -256,6 +259,9 @@ class PexpectReader(ExecutorComponent[PexpectExecutor]):
                 f'Unsupported type found: {type(content)}'
             )
             return ''
+    
+    def __str__(self) -> str:
+        return f'{resolve_classname(self)}()'
 
 
 @pexpect_reader_registry(key='default')

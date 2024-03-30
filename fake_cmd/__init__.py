@@ -13,6 +13,8 @@ for the main server namespace.
 server, so does ``client``.
 """
 
+__version__ = '0.0.5'
+
 # NOTE: Import ``readline`` here to improve input experience.
 try:
     import readline

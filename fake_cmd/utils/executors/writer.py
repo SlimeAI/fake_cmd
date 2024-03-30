@@ -4,6 +4,7 @@ from slime_core.utils.registry import Registry
 from slime_core.utils.typing import (
     Type
 )
+from fake_cmd.utils.common import resolve_classname
 from fake_cmd.utils.logging import logger
 from . import ExecutorComponent, PlatformPopenExecutor
 
@@ -48,8 +49,8 @@ class PopenWriter(ExecutorComponent[PlatformPopenExecutor]):
         """
         pass
 
-    def to_str(self) -> str:
-        return f'{self.__class__.__name__}()'
+    def __str__(self) -> str:
+        return f'{resolve_classname(self)}()'
 
 
 @popen_writer_registry(key='pipe')
@@ -89,11 +90,11 @@ class PipePopenWriter(PopenWriter):
         # ``__exit__``.
         return
 
-    def to_str(self) -> str:
+    def __str__(self) -> str:
         popen_stdin = self.executor.stdin
         fileno = popen_stdin.fileno() if popen_stdin else None
         return (
-            f'{self.__class__.__name__}'
+            f'{resolve_classname(self)}'
             f'(stdin={str(popen_stdin)}, '
             f'stdin_fileno={str(fileno)})'
         )
@@ -151,8 +152,8 @@ class PtyPopenWriter(PopenWriter):
         except Exception as e:
             logger.error(str(e), stack_info=True)
 
-    def to_str(self) -> str:
+    def __str__(self) -> str:
         return (
-            f'{self.__class__.__name__}'
+            f'{resolve_classname(self)}'
             f'(master={self.master}, slave={self.slave})'
         )

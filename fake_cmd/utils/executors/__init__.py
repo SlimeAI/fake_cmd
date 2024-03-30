@@ -23,7 +23,7 @@ from slime_core.utils.typing import (
     TYPE_CHECKING
 )
 from fake_cmd.utils import config
-from fake_cmd.utils.common import polling, get_control_char
+from fake_cmd.utils.common import polling, get_control_char, resolve_classname
 from fake_cmd.utils.logging import logger
 if TYPE_CHECKING:
     from .reader import PopenReader, PexpectReader
@@ -57,6 +57,16 @@ class Executor(
         pexpect.spawn, etc.).
         """
         return self.process is not MISSING
+    
+    @property
+    @abstractmethod
+    def pid(self) -> Any:
+        """
+        Pid of the process (we cannot ensure that this property always 
+        returns an integer value, and it can be ``None`` or anything else 
+        sometimes).
+        """
+        pass
     
     @abstractmethod
     def start(self) -> None:
@@ -158,6 +168,13 @@ class Executor(
         """
         pass
     
+    @abstractmethod
+    def __str__(self) -> str:
+        """
+        For display.
+        """
+        pass
+    
     #
     # Context manager usage.
     #
@@ -237,7 +254,7 @@ class PlatformPopenExecutor(Executor):
     
     @property
     def pid(self):
-        return self.process.pid
+        return getattr(self.process, 'pid', None)
     
     @property
     def poll(self):
@@ -299,6 +316,13 @@ class PlatformPopenExecutor(Executor):
         return (
             self.is_started() and 
             self.poll() is None
+        )
+    
+    def __str__(self) -> str:
+        return (
+            f'{resolve_classname(self)}'
+            f'(reader={str(self.reader)}, writer={str(self.writer)}, '
+            f'pid={self.pid}, encoding={self.encoding})'
         )
     
     def __exit__(self, *args, **kwargs):
@@ -407,6 +431,10 @@ class PexpectExecutor(Executor):
         # Bind Reader.
         self.reader.bind(self)
     
+    @property
+    def pid(self):
+        return getattr(self.process, 'pid', None)
+    
     def start(self) -> None:
         from pexpect import spawn
         self.process: Union[Missing, spawn] = spawn(
@@ -469,6 +497,13 @@ class PexpectExecutor(Executor):
         return (
             self.is_started() and 
             self.process.isalive()
+        )
+    
+    def __str__(self) -> str:
+        return (
+            f'{resolve_classname(self)}'
+            f'(reader={str(self.reader)}, pid={self.pid}, '
+            f'encoding={self.encoding})'
         )
     
     def __exit__(self, *args, **kwargs):

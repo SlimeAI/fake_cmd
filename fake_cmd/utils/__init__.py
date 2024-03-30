@@ -2,6 +2,7 @@ from slime_core.utils.typing import (
     Union,
     Tuple
 )
+from fake_cmd import __version__
 
 
 class Config:
@@ -48,7 +49,7 @@ class Config:
         self.heartbeat_max_interval: float = 20.0
         self.heartbeat_timeout: float = 600.0
         # The version info for compatibility check.
-        self.version: Tuple[int, int, int] = (0, 0, 5)
+        self.version: Tuple[int, int, int] = tuple(int(v) for v in __version__.split('.')[:3])
         # For system settings.
         self.platform: str = 'unix'
         self.posix_shlex: bool = True
