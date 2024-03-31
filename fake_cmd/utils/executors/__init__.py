@@ -185,6 +185,16 @@ class Executor(
         return self
     
     def __exit__(self, *args, **kwargs):
+        # Close read and write.
+        try:
+            self.close_read()
+        except Exception:
+            pass
+        
+        try:
+            self.close_write()
+        except Exception:
+            pass
         # Wait for the process to terminate.
         for _ in polling(config.cmd_polling_interval):
             if not self.is_running():
@@ -324,6 +334,11 @@ class PlatformPopenExecutor(Executor):
             f'(reader={str(self.reader)}, writer={str(self.writer)}, '
             f'pid={self.pid}, encoding={self.encoding})'
         )
+    
+    def __enter__(self):
+        super().__enter__()
+        self.process.__enter__()
+        return self
     
     def __exit__(self, *args, **kwargs):
         res = self.process.__exit__(*args, **kwargs)
