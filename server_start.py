@@ -1,3 +1,6 @@
+"""
+An example to start the server.
+"""
 import argparse
 from fake_cmd.core.server import Server
 from fake_cmd.utils.common import parser_parse

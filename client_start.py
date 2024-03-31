@@ -1,3 +1,6 @@
+"""
+An example to start the client.
+"""
 import argparse
 from fake_cmd.core.client import CLI
 from fake_cmd.utils.common import parser_parse
