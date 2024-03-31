@@ -4,7 +4,9 @@
 
 ## Get Started
 
-### Requirements
+### Installation
+
+#### Requirements
 
 ``slime_core`` is a necessary dependency, and install it as follows:
 
@@ -16,6 +18,14 @@ pip install slime_core
 
 ```bash
 pip install pexpect
+```
+
+#### Install fake_cmd
+
+Install ``fake_cmd`` as follows:
+
+```bash
+pip install fake_cmd
 ```
 
 ### Start the Server and the Client
