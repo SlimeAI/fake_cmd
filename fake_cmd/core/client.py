@@ -1207,6 +1207,16 @@ class InteractiveInput(
     ReadonlyAttr,
     metaclass=Metaclasses(ABCMeta, _ReadonlyAttrMetaclass)
 ):
+    """
+    Accept user input and send it to the remote session command.
+    
+    NOTE: fake_cmd simply displays the output from the session command, 
+    and it doesn't exactly know what the input prompt is (in the session 
+    command), so ``InteractiveInput`` may cause messed-up display (
+    especially when using ``readline``). Pressing EOF (e.g., ``Ctrl-D`` 
+    in Unix, ``Ctrl-Z`` in Windows, etc.) to start a new line can alleviate 
+    this problem.
+    """
     readonly_attr__ = (
         'cmd',
         'quit'
@@ -1254,6 +1264,11 @@ class InteractiveInput(
         state = self.state
         while True:
             try:
+                # NOTE: fake_cmd doesn't know what the input prompt 
+                # is, so the prompt is empty here, and the remote 
+                # output will be simultaneously displayed in the CLI. 
+                # This may cause messed-up display (especially when 
+                # using modules like ``readline``).
                 input_str = input()
                 if not self.cmd_running:
                     raise EOFError
@@ -1272,6 +1287,9 @@ class InteractiveInput(
                     print('Keyboard Interrupt (Interactive Input).')
                     state.add_keyboard_interrupt()
             except EOFError:
+                # NOTE: ``EOFError`` can be used to start a new line to 
+                # avoid messed-up display caused by simultaneous remote 
+                # output and client input.
                 with ignore_keyboard_interrupt():
                     if not self.cmd_running:
                         logger.info(f'Interactive mode quitted.')
