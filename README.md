@@ -1,6 +1,6 @@
 # fake_cmd
 
-fake_cmd provides a simulated command line based on file communication, in order to send commands from the client to the server for execution. It applies to situations where two computers cannot be connected through the network (which means ``ssh`` is impossible), but can be mounted onto the same hard disk.
+fake_cmd provides a simulated remote command line based on file communication, in order to send commands from the client to the server for execution. It applies to situations where two computers cannot be connected through the network (which means ``ssh`` is impossible), but can be mounted onto the same hard disk.
 
 ## Get Started
 
