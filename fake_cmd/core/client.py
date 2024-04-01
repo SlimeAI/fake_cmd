@@ -70,8 +70,8 @@ Help Document [fake_cmd]:
 
 1. Inner Commands:
 >>> ``help``: Get the help document.
->>> ``exit``: Shutdown the client, disconnect session.
->>> ``sid``: Get the sid of the client.
+>>> ``exit``: Shutdown the client and disconnect session.
+>>> ``sid``: Get the session id of the client.
 >>> ``ls-session``: List all the alive sessions.
 >>> ``ls-cmd``: List all the commands executing or queued.
 >>> ``ls-back``: List the background command of the current session.
@@ -93,7 +93,7 @@ package ``pexpect`` (Availability: Unix). Use ``pexpect -h`` to get more help.
 
 3. Killing the Running Command:
 >>> If using common ``cmd`` or ``--kill_disabled`` is not specified in the interactive \
-mode, the number of ``Ctrl+C`` you press represents different actions:
+mode, the number of times ``Ctrl+C`` is pressed represents different behaviors:
 - ({CMD_INTERRUPT}): Send keyboard interrupt to the command.
 - ({CMD_TERMINATE}): Terminate the command.
 - ({CMD_KILL}): Kill the command.
@@ -105,7 +105,9 @@ command according to different commands (e.g., use ``exit()`` in the Python inte
 mode, and use ``exit`` in the /bin/bash, etc.).
 
 4. Danger Zone:
->>> ``server_shutdown``: Shutdown the whole server. BE CAREFUL TO USE IT!!!
+>>> ``server_shutdown``: Shutdown the whole server. NOTE: The server can be shutdown by any \
+of the Clients, without any authorization required. When shutdown is executed, the Server will \
+terminate all the commands and destroy all the sessions. BE CAREFUL TO USE IT!!!
 {'=' * DOC_SEP_LEN}
 """
 
