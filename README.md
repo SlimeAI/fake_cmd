@@ -8,10 +8,10 @@
 
 #### Requirements
 
-``slime_core`` is a necessary dependency, and install it as follows:
+``slime_core`` is a necessary dependency, and install it as follows (Note that the version should be 0.0.1):
 
 ```bash
-pip install slime_core
+pip install slime-core==0.0.1
 ```
 
 ``pexpect`` is a recommended dependency (if you run the server on a Unix platform):
